@@ -158,4 +158,13 @@ argument names, the `cwd → session_id` rule and the memory round-trip.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GPL-3.0-or-later — see [LICENSE](LICENSE).
+
+Copyright (C) 2026 cxxiao.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. It is distributed in the hope that it will be useful, but **without
+any warranty**; without even the implied warranty of merchantability or
+fitness for a particular purpose.

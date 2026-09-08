@@ -8,12 +8,12 @@ dynamic = ["version"]
 description = "Academic literature backend over MCP: search, citation chains, research memory, paper download and PDF→Markdown."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "GPL-3.0-or-later" }
 keywords = ["mcp", "academic", "literature", "scopus", "openalex", "mineru", "pdf"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: MIT License",
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
