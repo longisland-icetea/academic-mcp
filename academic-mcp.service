@@ -1,0 +1,39 @@
+[Unit]
+Description=academic-mcp — paper download + MinerU conversion (MCP over HTTP)
+After=network-online.target academic-mcp-xvfb.service
+Wants=network-online.target academic-mcp-xvfb.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/academic-mcp
+ExecStart=%h/academic-mcp/.venv/bin/python %h/academic-mcp/academic-mcp.py
+Restart=on-failure
+RestartSec=5
+
+# Headful Firefox (needed for CloudFlare Turnstile) needs an X display.
+# academic-mcp-xvfb.service provides :99; the resolver prefers any Xvfb on
+# :99-:96 and only falls back to the ambient DISPLAY / headless.
+# Isolate the browser cache. Camoufox stores it under user_cache_dir("camoufox"),
+# which on wsl-zz-desktop collided with academic_agent's own (older) camoufox
+# install — 0.5.5 decided the mixed layout was stale and deleted the browser we
+# had copied in. XDG_CACHE_HOME keeps the two installs completely separate.
+Environment=XDG_CACHE_HOME=%h/.local/state/academic-mcp/cache
+Environment=DISPLAY=:99
+Environment=ACADEMIC_MCP_LOG_FILE=%h/.local/state/academic-mcp/server.log
+Environment=MOZ_ENABLE_WAYLAND=0
+Environment=GDK_BACKEND=x11
+
+# No proxy for outbound requests by default: publisher access must use the
+# institution IP.  Set DOWNLOAD_PROXY if your network requires one.
+Environment=DOWNLOAD_PROXY_MODE=fallback
+
+# Security: local-only, no ambient proxy credentials, no new privileges.
+NoNewPrivileges=true
+# PrivateTmp disabled: WSLg mounts its X socket under /tmp/.X11-unix,
+# which PrivateTmp would hide from the browser.
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=%h/data/academic %h/.local/state/academic-mcp %h/.cache/academic-mcp /tmp
+
+[Install]
+WantedBy=default.target

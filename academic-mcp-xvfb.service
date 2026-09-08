@@ -1,0 +1,23 @@
+[Unit]
+Description=Xvfb virtual display for academic-mcp (headful Camoufox)
+Before=academic-mcp.service
+
+[Service]
+Type=simple
+# Idempotent, and it must be: another service may already provide :99 (on
+# wsl-zz-desktop, academic_agent's daemon starts its own Xvfb :99).  Detect a
+# running Xvfb rather than a lock file — a stale lock from a crash would make
+# us skip starting and leave the browser with no display at all.
+#
+# Two subtleties in the pattern, both learned the hard way:
+#   * it is ANCHORED (^) — an unanchored `pgrep -f "Xvfb :99"` matches this very
+#     `sh -c` command line, so the guard always concludes a server is up and
+#     quietly never starts one;
+#   * the path is OPTIONAL — another service may have started Xvfb via PATH, so
+#     its cmdline is `Xvfb :99 ...` with no /usr/bin prefix.
+ExecStart=/bin/sh -c 'if pgrep -f "^(/usr/bin/)?Xvfb :99" >/dev/null 2>&1; then exit 0; fi; rm -f /tmp/.X99-lock; exec /usr/bin/Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

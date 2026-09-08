@@ -1,0 +1,23 @@
+# secrets and local state — never commit these
+.env
+*.env
+!.env.example
+
+# virtualenv / caches / build output
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# runtime data (the service owns these, they do not belong in git)
+data/
+*.log
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/

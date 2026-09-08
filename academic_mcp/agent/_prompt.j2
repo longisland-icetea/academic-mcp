@@ -1,0 +1,83 @@
+{# Working-memory prompt — §4.3 Jinja2 upgrade.
+
+   Rendered by memory.format_working_memory() into a text block injected
+   at the start of each subagent system prompt. Auto-escapes any HTML /
+   XML / template tags the user pasted into research_notes / importance /
+   etc. (P0-2 + P0-10). Tier "summary" keeps the budget at 12 KB; tier
+   "full" emits all excerpt text.
+#}
+{% if papers %}
+## Literature Library
+{% for p in papers %}
+### {{ loop.index }}. {{ p.title | truncate(100, true, "...") }}
+- paper_id: `{{ p.paper_id }}` | DOI: {{ p.doi }} | {{ p.first_author }} ({{ p.year }}) | status: {{ p.status }}
+{% if p.topics %}- Topics: {{ p.topics | join(", ") }}{% endif %}
+{% if p.relevance %}- Relevance: {{ p.relevance | truncate(150, true, "...") }}{% endif %}
+{% if p.importance %}
+{% if tier == "summary" %}- Importance: {{ p.importance | truncate(300, true, "...") }}{% else %}- Importance: {{ p.importance }}{% endif %}
+{% endif %}
+{% if p.key_notes %}
+{% if tier == "summary" %}- Key Notes: {{ p.key_notes | truncate(500, true, "...") }}{% else %}- Key Notes: {{ p.key_notes }}{% endif %}
+{% endif %}
+{% if p.key_excerpts %}
+{% if tier == "summary" %}- Key Excerpts: {{ p.key_excerpts | length }} passages (use academic_paper_recall to view)
+{% else %}- Key Excerpts ({{ p.key_excerpts | length }} passages):
+{% for exc in p.key_excerpts %}
+  [{{ loop.index }}] {{ exc | truncate(500, true, "...") }}
+{% endfor %}
+{% endif %}
+{% endif %}
+{% if p.detailed_notes %}
+{% if tier == "summary" %}- Detailed Notes: {{ p.detailed_notes | length }} chars (use academic_paper_recall to view)
+{% else %}- Detailed Notes: {{ p.detailed_notes }}
+{% endif %}
+{% endif %}
+
+{% endfor %}
+{% endif %}
+{% if skipped_count > 0 and tier == "summary" %}
+_({{ skipped_count }} additional papers skipped due to 12 KB summary budget; use academic_paper_recall to view individually.)_
+
+{% endif %}
+{% if key_findings %}
+## Key Findings ({{ key_findings | length }})
+{% for f in key_findings %}
+- [{{ f.confidence | default("?") }}] {{ f.text }} (from: {{ f.source_pids | default([]) | join(", ") }})
+{% endfor %}
+
+{% endif %}
+{% if unresolved_questions %}
+## Unresolved Questions ({{ unresolved_questions | length }})
+{% for q in unresolved_questions %}
+- {{ q.question | default(q) }}
+{% endfor %}
+
+{% endif %}
+{% if research_notes %}
+## Research Notes
+{{ research_notes | truncate(3000, true, "\n\n... (" + research_notes | length | string + " chars total, truncated)") }}
+
+{% endif %}
+{% if topic_map %}
+{% if tier == "summary" %}
+{% set multi = {} %}{% for t, pids in topic_map.items() %}{% if pids | length >= 2 %}{% set _ = multi.update({t: pids}) %}{% endif %}{% endfor %}
+{% if multi %}
+## Topic Map ({{ multi | length }} cross-paper topics{% if multi | length < (topic_map | length) %}, {{ topic_map | length }} total{% endif %})
+{% for topic, pids in multi.items() | sort %}- {{ topic }}: {{ pids | join(", ") }}
+{% endfor %}
+
+{% endif %}
+{% else %}
+## Topic Map ({{ topic_map | length }} topics)
+{% for topic, pids in topic_map.items() | sort %}- {{ topic }}: {{ pids | join(", ") }}
+{% endfor %}
+
+{% endif %}
+{% endif %}
+{% if research_goal %}
+---
+**Research Goal**: {{ research_goal }}
+{% endif %}
+{% if papers %}
+**Library stats**: {{ active_papers_count }} papers with notes{% if active_papers_count < (papers | length) %} ({{ papers | length }} total){% endif %}
+{% endif %}

@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "academic-mcp"
+dynamic = ["version"]
+description = "Academic literature backend over MCP: search, citation chains, research memory, paper download and PDF→Markdown."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["mcp", "academic", "literature", "scopus", "openalex", "mineru", "pdf"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = [
+  "mcp>=2.0",
+  "httpx>=0.27",
+  "ddgs>=9.0",
+  "python-docx>=1.1",
+  "jinja2>=3.1",
+  # Browser fallback for paywalled publishers. PINNED on purpose: camoufox's
+  # browser layout is version-specific, and an unpinned upgrade invalidates the
+  # downloaded browser. Bump together with a fresh `camoufox fetch`.
+  "camoufox[geoip]==0.5.5",
+  "playwright>=1.45",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+
+[project.scripts]
+academic-mcp = "academic_mcp.server:main"
+
+[tool.hatch.version]
+path = "academic_mcp/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["academic_mcp"]
+# `_prompt.j2` is loaded at runtime by the working-memory formatter, so it must
+# ship inside the wheel.
+artifacts = ["academic_mcp/agent/_prompt.j2"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = [".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
