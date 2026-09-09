@@ -837,9 +837,15 @@ def cmd_telemetry(memory: dict[str, Any], limit: int = 20) -> dict[str, Any]:
     if not telemetry_dir.exists():
         return {"status": "ok", "count": 0, "entries": [], "note": "no telemetry dir"}
 
-    # Files: <session_id>.<timestamp>.jsonl (one record per line, JSONL format)
-    pattern = f"{memory.get('session_id', '*')}.*.jsonl"
+    # Files: <session_id>.jsonl — one append-only file per session. The DSH
+    # preset writes exactly that name; an older writer used
+    # <session_id>.<timestamp>.jsonl, so both are collected for one session.
+    sid = memory.get("session_id") or "*"
+    pattern = f"{sid}.*.jsonl" if sid != "*" else "*.jsonl"
     files = sorted(telemetry_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    own = telemetry_dir / f"{sid}.jsonl"
+    if sid != "*" and own.is_file():
+        files = [own, *[p for p in files if p != own]]
     entries = []
     for fpath in files[:limit]:
         try:
@@ -854,7 +860,7 @@ def cmd_telemetry(memory: dict[str, Any], limit: int = 20) -> dict[str, Any]:
                 entries.append(rec)
         except OSError:
             continue
-    # Trim to limit
+    # Trim to the most recent `limit` entries.
     entries = entries[-limit:]
     return {
         "status": "ok",

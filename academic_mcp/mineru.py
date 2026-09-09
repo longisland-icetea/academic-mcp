@@ -159,10 +159,16 @@ def _create_task(
         raise _Transient(f"HTTP {resp.status_code}")
     if resp.status_code != 200:
         raise MineruError(f"MinerU task creation failed: HTTP {resp.status_code} {resp.text[:200]}")
-    data = (resp.json() or {}).get("data") or {}
+    body = resp.json() or {}
+    # MinerU reports application errors as HTTP 200 with a non-zero `code` and a
+    # human-readable `msg` (e.g. code -10002 "model_version 'vlm' cannot process
+    # html files"). Reporting only "missing batch_id" hid the actual reason.
+    if body.get("code") not in (None, 0):
+        raise MineruError(f"MinerU rejected the task: {body.get('msg') or body.get('code')}")
+    data = body.get("data") or {}
     batch_id = data.get("batch_id")
     if not batch_id:
-        raise MineruError("MinerU response missing batch_id")
+        raise MineruError(f"MinerU response missing batch_id: {resp.text[:200]}")
     return batch_id, list(data.get("file_urls") or [])
 
 

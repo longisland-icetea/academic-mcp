@@ -89,14 +89,24 @@ async def citation_chain(
     direction: str = "both",
     limit: int = 20,
     proxy: str = "",
+    session_id: str = "",
 ) -> dict[str, Any]:
-    """Forward/backward citation chain over DOIs (OpenAlex)."""
+    """Forward/backward citation chain over DOIs (OpenAlex).
+
+    `session_id` matters beyond bookkeeping: `snowball()` authorises the
+    returned DOIs by writing them into the session's search cache, and that
+    cache is exactly what `validate_doi` reads. Without the caller's session
+    the DOIs land in the `default` cache, so `academic_import_papers` rejects
+    them for a session that legitimately discovered them.
+    """
     clean = [str(seed).strip() for seed in (seeds or []) if str(seed).strip()]
     if not clean:
         return {"ok": False, "error": "at least one seed DOI is required", "results": []}
     limit = max(1, min(int(limit or 20), 100))
     direction = direction if direction in ("forward", "backward", "both") else "both"
-    results, stats = await snowball_mod.snowball(clean, direction, limit, proxy or "")
+    results, stats = await snowball_mod.snowball(
+        clean, direction, limit, proxy or "", session_id=session_id
+    )
     return {"ok": True, "seeds": clean, "direction": direction, "count": len(results), "stats": stats, "results": results}
 
 
@@ -232,8 +242,11 @@ def register(server: Any) -> None:
         direction: str = "both",
         limit: int = 20,
         proxy: str = "",
+        session_id: str = "",
     ) -> str:
-        return _payload(await citation_chain(seeds, direction, limit, proxy))
+        return _payload(
+            await citation_chain(seeds, direction, limit, proxy, session_id)
+        )
 
     @server.tool(
         name="memory",

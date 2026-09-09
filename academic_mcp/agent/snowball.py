@@ -149,7 +149,7 @@ async def _fetch_work_by_id(client: httpx.AsyncClient, work_id: str) -> dict[str
             return None
 
 
-async def snowball(seeds: list[str], direction: str, limit: int, proxy: str = "") -> tuple[list[dict[str, Any]], dict[str, Any]]:
+async def snowball(seeds: list[str], direction: str, limit: int, proxy: str = "", session_id: str = "") -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Expand from seed DOIs. Returns (normalized papers, engine_status).
 
     Args:
@@ -157,6 +157,9 @@ async def snowball(seeds: list[str], direction: str, limit: int, proxy: str = ""
         direction: "forward" / "backward" / "both".
         limit: Max results.
         proxy: Optional proxy URL (overrides GFW_PROXY env). P2-12.
+        session_id: Session whose search cache authorises the returned DOIs.
+            Empty means the service's own session (usually `default`), which is
+            almost never what a client wants — pass the caller's session.
     """
     # httpx renamed `proxies=` → `proxy=` in 0.26 and REMOVED `proxies=` in
     # 0.28.  (An earlier "fix" inverted this and passed `proxies=`, which
@@ -225,7 +228,11 @@ async def snowball(seeds: list[str], direction: str, limit: int, proxy: str = ""
 
         # 4. Save to session search cache (enables academic_import_papers download)
         if results:
-            save_search_cache(results, f"snowball:{direction}({','.join(seeds)})")
+            save_search_cache(
+                results,
+                f"snowball:{direction}({','.join(seeds)})",
+                session_id,
+            )
 
         status = {"status": "ok", "count": len(results),
                   "direction": direction, "seeds": len(seed_works)}

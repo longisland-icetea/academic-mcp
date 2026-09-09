@@ -20,7 +20,7 @@ Everything that needs Python lives here. A client only sends tool calls.
 | Tool | Purpose |
 |------|---------|
 | `search_papers` | Scopus + OpenAlex search, merged, deduplicated and hybrid-reranked. `doi` looks a single paper up directly. Records the session's DOIs so `validate_doi` can authorise a download. |
-| `citation_chain` | Forward / backward citation expansion from seed DOIs (OpenAlex). |
+| `citation_chain` | Forward / backward citation expansion from seed DOIs (OpenAlex). Pass `session_id` so the results are authorised for download by that session. |
 | `memory` | Per-project research memory: `working-memory`, `session-key`, `update`, `list`, `get`, `goal`, `note`, `finding`, `unresolved`, `progress`, `resume`, `delete-paper`, `dump`. |
 | `telemetry` | Read a session's tool-call log. |
 | `fetch_paper_text` | DOI → full text (Markdown), cached under `<data_dir>/texts/`. |

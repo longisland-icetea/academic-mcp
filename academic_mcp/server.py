@@ -59,7 +59,12 @@ mcp = MCPServer(
 # Bumped whenever a tool's argument surface changes. Clients compare it against
 # their own expectations (see the `contract` tool) instead of discovering a
 # mismatch from a failed call.
-CONTRACT_VERSION = 1
+#
+# 2 — `citation_chain` gained `session_id`. Clients that pass it rely on the
+#     returned DOIs being written to THAT session's search cache; an older
+#     server accepts the call and files them under `default`, which makes
+#     `validate_doi` reject them later.
+CONTRACT_VERSION = 2
 
 
 def _payload(obj: Any) -> str:

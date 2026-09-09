@@ -132,3 +132,40 @@ async def test_memory_tool_rejects_unknown_op():
     payload = await agent_tools.memory("nope")
     assert payload["ok"] is False
     assert "unknown op" in payload["error"]
+
+
+async def test_citation_chain_accepts_session_id():
+    """`session_id` must reach the tool that writes the DOI allowlist.
+
+    It was accepted by `citation_chain()` but dropped by the registered wrapper,
+    so every citation-chain result was filed under `default` and then refused by
+    `validate_doi` for the session that discovered it.
+    """
+    tool = next(t for t in await mcp.list_tools() if t.name == "citation_chain")
+    assert "session_id" in tool.input_schema["properties"]
+    spec = json.loads(await contract())["tools"]["citation_chain"]
+    assert "session_id" in spec["optional"]
+
+
+async def test_citation_chain_forwards_session_id_to_snowball(monkeypatch):
+    """`session_id` must reach `snowball()`, which owns the DOI cache write.
+
+    The parameter was accepted by `citation_chain()` but dropped before the
+    call, so every citation-chain hit was filed under `default.json` and
+    `validate_doi` then refused it for the session that discovered it.
+    """
+    from academic_mcp.agent import snowball as snowball_mod
+
+    seen = {}
+
+    async def fake_snowball(seeds, direction, limit, proxy="", session_id=""):
+        seen.update(seeds=seeds, direction=direction, limit=limit, session_id=session_id)
+        return [], {"status": "ok", "count": 0}
+
+    monkeypatch.setattr(snowball_mod, "snowball", fake_snowball)
+    payload = await agent_tools.citation_chain(
+        ["10.1/x"], "forward", 5, session_id="--home-alice--"
+    )
+    assert payload["ok"] is True
+    assert seen["session_id"] == "--home-alice--"
+    assert seen["seeds"] == ["10.1/x"]
