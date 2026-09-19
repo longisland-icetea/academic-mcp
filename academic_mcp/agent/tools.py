@@ -46,6 +46,23 @@ async def search_papers(
         paper = await search_mod.lookup_doi(doi)
         if paper is None:
             return {"ok": False, "error": f"no metadata for DOI {doi}", "results": [], "count": 0}
+        # Authorise what we just resolved, exactly as the keyword path does.
+        #
+        # This branch used to return BEFORE the `save_cache` call below, so a
+        # DOI lookup resolved the paper and then declined to record it — and
+        # since `validate_doi` authorises downloads by reading that same cache,
+        # the documented remedy for a rejected DOI ("academic_search(query=
+        # '<DOI>') 已知 DOI 的补票通道") could never work. Verified against the
+        # live service: lookup succeeded with count=1 and the DOI was still
+        # absent from the cache afterwards, so the following validate_doi
+        # rejected it with code `reject`.
+        #
+        # That made the rejection message actively misleading — it told the
+        # caller to take a path that provably could not succeed, which is worse
+        # than saying nothing, because the caller retries instead of looking for
+        # the real cause.
+        if save_cache:
+            search_mod.save_search_cache([paper], query or doi, session_id)
         return {"ok": True, "query": doi, "doi": doi, "count": 1, "results": [paper]}
 
     if not (query or author or journal):
