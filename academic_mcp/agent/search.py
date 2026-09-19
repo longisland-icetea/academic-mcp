@@ -419,9 +419,7 @@ async def search_scopus(query: str, limit: int = 20, year: str = None,
             resp = await _with_retry(client.get)("", params=complete_params)
             if resp.status_code == 200:
                 data = resp.json()
-                entries = data.get("search-results", {}).get("entry", [])
-                if isinstance(entries, dict):
-                    entries = [entries]
+                entries = _scopus_real_entries(data)
                 results = [normalize_scopus(e, "COMPLETE") for e in entries[:limit]]
                 total = data.get("search-results", {}).get("opensearch:totalResults", 0)
                 _log(f"Scopus COMPLETE: {len(results)} results (total={total})")
@@ -446,9 +444,7 @@ async def search_scopus(query: str, limit: int = 20, year: str = None,
                 _log(f"Scopus STANDARD HTTP {resp.status_code}")
                 return []
             data = resp.json()
-            entries = data.get("search-results", {}).get("entry", [])
-            if isinstance(entries, dict):
-                entries = [entries]
+            entries = _scopus_real_entries(data)
             results = [normalize_scopus(e, "STANDARD") for e in entries[:limit]]
             total = data.get("search-results", {}).get("opensearch:totalResults", 0)
             _log(f"Scopus STANDARD: {len(results)} results (total={total})")
@@ -494,6 +490,24 @@ async def _fetch_scopus_abstract(doi: str) -> str | None:
     return None
 
 
+def _scopus_real_entries(data: dict) -> list:
+    """Scopus search entries, with the "Result set was empty" stub removed.
+
+    An empty result set is returned as HTTP 200 with a NON-EMPTY `entry` list::
+
+        "entry": [{"@_fa": "true", "error": "Result set was empty"}]
+
+    so code that only checks truthiness of `entry` normalizes the stub into a
+    paper with a blank title, no DOI and no authors. That is how a DOI which
+    does not exist came back from the service as `ok: true, count: 1`, and how a
+    keyword search with no matches could return a phantom blank result.
+    """
+    entries = data.get("search-results", {}).get("entry", [])
+    if isinstance(entries, dict):
+        entries = [entries]
+    return [e for e in entries if isinstance(e, dict) and "error" not in e]
+
+
 async def search_scopus_by_doi(doi: str) -> dict | None:
     """Look up a single paper by DOI in Scopus.
 
@@ -502,6 +516,18 @@ async def search_scopus_by_doi(doi: str) -> dict | None:
     when the API key lacks COMPLETE-view permission (401/403) or the
     COMPLETE result is empty; STANDARD still returns the author list but
     no abstract.
+
+    A "no such DOI" is reported by Scopus as **HTTP 200 with a NON-EMPTY
+    `entry` list whose only element is an error stub**::
+
+        "entry": [{"@_fa": "true", "error": "Result set was empty"}]
+
+    so `if entries:` is always true and the stub was normalized into a "paper"
+    with a blank title, no DOI and no authors. That is how a DOI which does not
+    exist came back from the service as `ok: true, count: 1` with an empty
+    record — and any caller that treats a hit as a real paper (import
+    authorisation, for one) accepted it and only discovered the problem at
+    download time. Dropping the stub is what makes a miss a miss.
     """
     if not ELSEVIER_API_KEY:
         return None
@@ -519,18 +545,14 @@ async def search_scopus_by_doi(doi: str) -> dict | None:
             # COMPLETE view first: carries the abstract + full author list
             resp = await _with_retry(client.get)("", params={"query": f"DOI({clean_doi})", "view": "COMPLETE", "count": 1})
             if resp.status_code == 200:
-                entries = resp.json().get("search-results", {}).get("entry", [])
-                if isinstance(entries, dict):
-                    entries = [entries]
+                entries = _scopus_real_entries(resp.json())
                 if entries:
                     return normalize_scopus(entries[0], "COMPLETE")
             # Fallback: STANDARD view (authors only, no abstract) — e.g.
             # key without COMPLETE permission (401/403) or empty result
             resp2 = await _with_retry(client.get)("", params={"query": f"DOI({clean_doi})", "view": "STANDARD", "count": 1})
             if resp2.status_code == 200:
-                entries = resp2.json().get("search-results", {}).get("entry", [])
-                if isinstance(entries, dict):
-                    entries = [entries]
+                entries = _scopus_real_entries(resp2.json())
                 if entries:
                     return normalize_scopus(entries[0])
         except Exception as e:
