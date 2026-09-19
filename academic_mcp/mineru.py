@@ -55,6 +55,17 @@ SUPPORTED_SUFFIX = {
     ".html", ".htm",
 }
 
+# ``model_version`` is not universal across suffixes. HTML is the one measured
+# case: both ``vlm`` and ``pipeline`` reject it —
+#     MinerU rejected the task: model_version 'vlm' cannot process html files
+# — and only ``MinerU-HTML`` accepts it. Keeping html in SUPPORTED_SUFFIX while
+# sending it under the default model produced a format that was advertised as
+# supported and could never convert, so the model is now chosen per suffix.
+MODEL_BY_SUFFIX = {
+    ".html": "MinerU-HTML",
+    ".htm": "MinerU-HTML",
+}
+
 MAX_BYTES = 200 * 1024 * 1024
 
 # The service's own cache: converted documents never belong to a client.
@@ -390,6 +401,24 @@ def _safe_stem(text: str) -> str:
     return cleaned
 
 
+def _suffix_of(source: str, local_path: Path | None) -> str:
+    """Lower-cased suffix of a local path, or of a URL's last path segment."""
+    if local_path is not None:
+        return local_path.suffix.lower()
+    return Path(source.split("?")[0].split("#")[0].rstrip("/")).suffix.lower()
+
+
+def model_for_source(source: str, local_path: Path | None, configured: str) -> str:
+    """The model that can actually parse this source's suffix.
+
+    ``configured`` is the operator's ``MINERU_MODEL`` and stays authoritative for
+    every suffix without a dedicated entry — measured: pdf, docx, xlsx and even
+    the legacy binary .ppt all convert under the default ``vlm``. A caller that
+    names a model explicitly never reaches this function.
+    """
+    return MODEL_BY_SUFFIX.get(_suffix_of(source, local_path), configured)
+
+
 def _resolve(source: str, name: str | None) -> tuple[bool, str, str, Path | None]:
     """Return (is_url, source_id, source_hash, local_path)."""
     if source.startswith(("http://", "https://")):
@@ -453,12 +482,20 @@ def convert_document(
             "and export MINERU_TOKEN."
         )
 
+    requested_model = model
     model = model or settings.mineru_model
     lang = lang or settings.mineru_language
     out_dir = Path(out_dir or DOC_CACHE_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     is_url, source_id, src_hash, local_path = _resolve(source, name)
+
+    # Suffix-based selection runs only when the caller named no model, so an
+    # explicit `model="vlm"` still wins (and still fails for HTML — which is now
+    # the caller's own, visible choice rather than a silent trap).
+    if requested_model is None:
+        model = model_for_source(source, local_path, model)
+
     opts = {
         "model": model, "lang": lang, "pages": pages,
         "ocr": ocr, "formula": formula, "table": table,
