@@ -154,8 +154,6 @@ class ElsevierResolver:
             "X-ELS-APIKey": settings.elsevier_api_key,
             "Accept": "application/pdf",
         }
-        if settings.elsevier_insttoken:
-            headers["X-ELS-Insttoken"] = settings.elsevier_insttoken
 
         result = await httpclient.fetch(url, headers=headers, want_pdf=True, attempts=2)
         if result.ok:

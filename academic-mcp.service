@@ -23,9 +23,8 @@ Environment=ACADEMIC_MCP_LOG_FILE=%h/.local/state/academic-mcp/server.log
 Environment=MOZ_ENABLE_WAYLAND=0
 Environment=GDK_BACKEND=x11
 
-# No proxy for outbound requests by default: publisher access must use the
-# institution IP.  Set DOWNLOAD_PROXY if your network requires one.
-Environment=DOWNLOAD_PROXY_MODE=fallback
+# Proxy policy (DOWNLOAD_PROXY / DOWNLOAD_PROXY_MODE, GFW_PROXY)
+# lives in .env: one source of truth. Nothing is pinned here.
 
 # Security: local-only, no ambient proxy credentials, no new privileges.
 NoNewPrivileges=true

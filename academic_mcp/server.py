@@ -64,7 +64,7 @@ mcp = MCPServer(
 #     returned DOIs being written to THAT session's search cache; an older
 #     server accepts the call and files them under `default`, which makes
 #     `validate_doi` reject them later.
-CONTRACT_VERSION = 2
+CONTRACT_VERSION = 4
 
 
 def _payload(obj: Any) -> str:

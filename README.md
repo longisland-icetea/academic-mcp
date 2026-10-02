@@ -47,14 +47,17 @@ The essentials:
 | `MINERU_TOKEN` | MinerU cloud PDF→Markdown (required for conversion) | — |
 | `ELSEVIER_API_KEY` | Scopus search + ScienceDirect download | — |
 | `OPENALEX_API_KEY` | OpenAlex search + citation chains | — |
-| `DOWNLOAD_PROXY` | publisher downloads **and** Scopus/OpenAlex search; empty = direct | — |
-| `GFW_PROXY` | arXiv / search-engine fallback only | — |
+| `DOWNLOAD_PROXY` | publisher/API access, and the rescue route in `failover` mode; empty = direct only | — |
+| `DOWNLOAD_PROXY_MODE` | `primary` / `fallback` / `failover` / `none` | `fallback` |
+| `GFW_PROXY` | primary route for OpenAlex search / arXiv (failover hop applies here too) | — |
 | `ACADEMIC_MCP_HOST` / `ACADEMIC_MCP_PORT` | listen address | `127.0.0.1` / `8790` |
 | `ACADEMIC_DOC_CACHE` | local conversion cache | `~/.cache/academic-mcp/doc-read` |
 
 Full list with defaults and tuning knobs: [`.env.example`](.env.example).
-`ELSEVIER_INSTTOKEN` is an optional subscription-institution token — leave it
-empty unless your library requires it.
+There are two proxy settings and one Elsevier credential: `DOWNLOAD_PROXY`
+(publisher/API access, and the rescue route in `failover` mode) and
+`GFW_PROXY` (arXiv/search engines/OpenAlex). `ELSEVIER_API_KEY` alone is
+enough for metadata; an institutional insttoken is not supported.
 
 Restart the service after editing (configuration is read once at startup):
 

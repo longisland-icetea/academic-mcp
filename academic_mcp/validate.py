@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
 from . import storage
+from .agent.memory import DEFAULT_SESSION, normalise_session_id
 from .config import settings
 
 logger = logging.getLogger("academic_mcp.validate")
@@ -33,21 +35,18 @@ class Denied(Exception):
         self.code = code
 
 
-# pi's session ids look like `--home-cxxiao--` / `--mnt-c-Users-project-BSE_hBN--`.
-# Anything else is rejected rather than interpolated into a path: the value ends
-# up in `data_dir / f"{sid}.json"`, so an unvalidated one is a traversal hole
-# (e.g. "../../etc/passwd" would happily read outside the data directory).
-_SESSION_ID_RE = re.compile(r"^--[A-Za-z0-9._-]+--$")
-
-
+# pi's session ids look like `--home-cxxiao--` / `--mnt-c-Users-project-BSE_hBN--`,
+# and a DSH client derives exactly the same spelling from the session's cwd (see
+# `memory.session_key_for_cwd`). The one thing this module must not do is
+# re-implement the character rule: it used to allow only `[A-Za-z0-9._-]`, which
+# silently turned every non-ASCII project key into "default" and made the DOI
+# allowlist read a different file than the one search wrote. Path safety is
+# checked in one place now — `memory.is_session_key` — and that rule accepts CJK
+# because a cwd containing CJK encodes to a key containing CJK.
 def _session_id(session_id: str | None) -> str:
-    import os
-
-    raw = session_id or os.environ.get(_SESSION_ENV) or "default"
-    if raw != "default" and not _SESSION_ID_RE.match(raw):
-        logger.warning("rejecting malformed session id %r; falling back to 'default'", raw)
-        return "default"
-    return raw
+    return normalise_session_id(
+        session_id or os.environ.get(_SESSION_ENV) or DEFAULT_SESSION, logger=logger
+    )
 
 
 def _norm(doi: str) -> str:

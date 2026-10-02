@@ -151,7 +151,6 @@ class Settings:
 
     # ── Elsevier / ScienceDirect API ───────────────────────────────────
     elsevier_api_key: str = field(default_factory=lambda: env("ELSEVIER_API_KEY"))
-    elsevier_insttoken: str = field(default_factory=lambda: env("ELSEVIER_INSTTOKEN"))
 
     # ── Literature search (Scopus + OpenAlex) ──────────────────────────
     openalex_api_key: str = field(default_factory=lambda: env("OPENALEX_API_KEY"))
@@ -163,13 +162,23 @@ class Settings:
     download_proxy: str | None = field(
         default_factory=lambda: _normalise_proxy(env("DOWNLOAD_PROXY"))
     )
-    # "primary"  – always go through the proxy
-    # "fallback" – direct first, proxy on timeout/network error
+    # "primary"  – always go through DOWNLOAD_PROXY
+    # "fallback" – direct first, DOWNLOAD_PROXY on a transport failure
+    # "failover" – normal route first (direct, or DOWNLOAD_PROXY when set),
+    #              then DOWNLOAD_PROXY on a transport failure
     # "none"     – never (except arXiv, which is not paywalled)
+    #
+    # `failover` used to take its rescue route from a THIRD key,
+    # DOWNLOAD_PROXY_FALLBACK, which made it the one mode DOWNLOAD_PROXY could
+    # not configure: a deployment that set only DOWNLOAD_PROXY declared a proxy
+    # it would never hop to. That key is gone. There are exactly two proxy
+    # settings — GFW_PROXY (arXiv / search engines / OpenAlex) and
+    # DOWNLOAD_PROXY (publishers and APIs) — and `failover` now means
+    # "primary route first, DOWNLOAD_PROXY if that fails at the transport level".
     download_proxy_mode: str = field(
         default_factory=lambda: (env("DOWNLOAD_PROXY_MODE", "fallback").lower())
     )
-    # gfw_proxy: used for arXiv / search-engine fallbacks.
+    # gfw_proxy: primary proxy for arXiv / search-engine / OpenAlex access.
     gfw_proxy: str | None = field(default_factory=lambda: _normalise_proxy(env("GFW_PROXY")))
 
     # ── Camoufox browser automation ────────────────────────────────────
@@ -208,6 +217,11 @@ class Settings:
 
     def __post_init__(self) -> None:
         self.data_dir = Path(self.data_dir).expanduser()
+        # An unknown mode used to behave differently in each call site (the
+        # pooled client ignored it, the browser honoured it). Normalise once,
+        # here, so every consumer sees the same policy.
+        if self.download_proxy_mode not in ("primary", "fallback", "failover", "none"):
+            self.download_proxy_mode = "fallback"
 
     @property
     def pdf_dir(self) -> Path:

@@ -16,9 +16,10 @@ Structured search (for known bibliographic metadata):
 
 Environment:
   ELSEVIER_API_KEY        Scopus API key (https://dev.elsevier.com/)
-  ELSEVIER_INSTTOKEN      Optional institutional token
-  DOWNLOAD_PROXY          HTTP proxy for Scopus/OpenAlex (e.g. http://192.168.255.1:8888); unset = direct
-  GFW_PROXY               Fallback proxy for OpenAlex when behind GFW
+  DOWNLOAD_PROXY          Primary proxy for Scopus (e.g. http://192.168.255.1:8888); unset = direct
+  DOWNLOAD_PROXY_MODE     primary|fallback|failover|none — failover retries a transport failure
+  DOWNLOAD_PROXY          Rescue route for failover mode
+  GFW_PROXY               Primary proxy for OpenAlex when behind GFW
   OPENALEX_API_KEY        Optional OpenAlex premium key
 
 Output:
@@ -27,6 +28,7 @@ Output:
 
 import argparse
 import asyncio
+import difflib
 import json
 import os
 import re
@@ -50,12 +52,16 @@ except ImportError:
 # environment / .env — so this module never walks a client's directory tree.
 from ..config import settings as _settings
 
+# Shared HTTP plumbing: the route-health memory (order_routes / mark_route_*)
+# is what makes failover fast as well as correct — a route that just failed
+# while another succeeded is tried last on the next request.
+from ..httpclient import mark_route_failed, mark_route_ok, order_routes
+
 # =========================================================================
 # Configuration
 # =========================================================================
 
 ELSEVIER_API_KEY = _settings.elsevier_api_key
-ELSEVIER_INSTTOKEN = _settings.elsevier_insttoken
 DOWNLOAD_PROXY = (_settings.download_proxy or "").strip()
 GFW_PROXY = _settings.gfw_proxy or ""
 OPENALEX_API_KEY = _settings.openalex_api_key
@@ -219,7 +225,16 @@ try:
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, max=10),
         retry=retry_if_exception_type((
-            _httpx.ConnectError, _httpx.ReadTimeout, _httpx.RemoteProtocolError,
+            _httpx.ConnectError,
+            # `ConnectTimeout` is NOT a subclass of `ConnectError` — both derive
+            # from `TransportError`. The tuple used to name only `ConnectError`
+            # and `ReadTimeout`, so a connect timeout was the one transport
+            # failure that never retried. It is named explicitly (and
+            # `TimeoutException`/`TransportError` cover the rest of the family)
+            # rather than left to chance: a dropped packet on the first attempt
+            # is exactly the case a retry exists for.
+            _httpx.ConnectTimeout, _httpx.ReadTimeout, _httpx.TimeoutException,
+            _httpx.RemoteProtocolError, _httpx.TransportError,
             _httpx.HTTPStatusError,  # raised by _safe_json() on 5xx
         )),
         reraise=True,
@@ -262,6 +277,144 @@ def _client_kwargs() -> dict:
         "timeout": httpx.Timeout(overall, connect=10.0),
         "follow_redirects": True,
     }
+
+
+#: Connect timeout for the Elsevier host specifically.
+#:
+#: Scopus is the only engine that is probed on a path where a *transport* answer
+#: is not needed to produce a result — OpenAlex is queried in parallel and the
+#: merge is unaffected. Probing it with the same 10 s connect timeout cost a
+#: measured 45 s per search when the host is unreachable (3 attempts × 10 s
+#: connect + exponential backoff), which is what made "the search is slow" a
+#: separate complaint from "Scopus is down". A down host answers a SYN with
+#: nothing at all, so a shorter connect budget detects it sooner while a
+#: REACHABLE but slow Scopus still gets the full read timeout for its data.
+_SCOPUS_CONNECT_TIMEOUT = 4.0
+
+
+def _scopus_client_kwargs() -> dict:
+    kwargs = _client_kwargs()
+    kwargs["timeout"] = httpx.Timeout(float(_settings.search_timeout), connect=_SCOPUS_CONNECT_TIMEOUT)
+    return kwargs
+
+
+# ── Proxy routing for search engines ──────────────────────────────────────
+#
+# Same policy as academic_mcp.httpclient.fetch, in the shape these engine calls
+# use: a transport-level failure on the first route retries the request through
+# the next route, which is DOWNLOAD_PROXY. An HTTP answer never fails over — the
+# engine answered, and another exit cannot change that.
+
+def _route_chain(primary: str | None) -> list[str | None]:
+    """One engine's route chain: primary first, rescue hop last.
+
+    ``primary=None`` means a direct connection. In ``failover`` mode the chain
+    gains DOWNLOAD_PROXY as its rescue route; other modes leave the chain as it
+    was made.
+
+    The rescue route used to come from a separate ``DOWNLOAD_PROXY``
+    key, so a deployment that set only DOWNLOAD_PROXY — the natural reading of
+    "I have a proxy" — got a single-route chain and no failover at all. The
+    rescue route is now the same setting it always should have been.
+    """
+    routes: list[str | None] = [primary]
+    hop = _settings.download_proxy
+    if _settings.download_proxy_mode == "failover" and hop and hop != primary:
+        routes.append(hop)
+    return routes
+
+
+def _scopus_routes() -> list[str | None]:
+    """Scopus route chain: DIRECT first, DOWNLOAD_PROXY as the rescue.
+
+    Not ``_route_chain(DOWNLOAD_PROXY)``: passing the proxy as the primary put
+    it at BOTH ends of the chain, so the dedup collapsed it to a single
+    proxy-only route. That inverted the intent — the institution-IP direct
+    connection is the fast, correct route to api.elsevier.com and the proxy is
+    the backup, so routing every search through the proxy would make normal
+    operation slower and depend on a hop that exists to be a fallback.
+    """
+    return _route_chain(None)
+
+
+def _openalex_routes() -> list[str | None]:
+    """OpenAlex route chain: GFW_PROXY when configured, else direct.
+
+    OpenAlex really is reached THROUGH the GFW proxy (that is why the setting
+    exists), so here the proxy is the primary route and DOWNLOAD_PROXY is not
+    involved at all.
+    """
+    return _route_chain(GFW_PROXY or None)
+
+
+class FailoverClient:
+    """Small httpx wrapper: per-request retry, plus transport-level failover.
+
+    ``get()`` applies the module's bounded-retry policy (``_with_retry``) on
+    the first route and, when that fails at the *transport* level (connect
+    timeout, reset, blackhole), retries once on each remaining route — so a
+    blackholed primary can no longer take the whole engine down.
+
+    A standalone class rather than a helper in ``academic_mcp.httpclient``
+    because these engines use the tenacity retry shape and their own timeouts,
+    and because this module is also usable as a script.
+    """
+
+    def __init__(self, routes: list[str | None], *, ns: str, **client_kwargs: Any) -> None:
+        self._routes = list(routes) or [None]
+        self._ns = ns
+        # Deterministic routing: never inherit ambient *_proxy variables,
+        # which would otherwise silently hijack every call.
+        self._client_kwargs = {"trust_env": False, **client_kwargs}
+        self._clients: dict[str | None, httpx.AsyncClient] = {}
+
+    def _client_for(self, proxy: str | None) -> httpx.AsyncClient:
+        client = self._clients.get(proxy)
+        if client is None or client.is_closed:
+            kwargs = dict(self._client_kwargs)
+            if proxy:
+                kwargs["proxy"] = proxy
+            client = httpx.AsyncClient(**kwargs)
+            self._clients[proxy] = client
+        return client
+
+    async def get(self, url: str, *, params: dict | None = None, **kwargs: Any) -> httpx.Response:
+        routes = order_routes(self._routes, self._ns)
+        failed: list[str | None] = []
+        last_exc: Exception | None = None
+        for idx, route in enumerate(routes):
+            try:
+                resp = await _with_retry(self._client_for(route).get)(
+                    url, params=params, **kwargs
+                )
+                mark_route_ok(self._ns, route)
+                for bad in failed:
+                    mark_route_failed(self._ns, bad)
+                return resp
+            except (_httpx.TransportError, _httpx.TimeoutException) as exc:
+                last_exc = exc
+                failed.append(route)
+                if idx + 1 < len(routes):
+                    _log(
+                        f"{self._ns}: {'direct' if route is None else route} "
+                        f"unreachable ({type(exc).__name__}); trying "
+                        f"{routes[idx + 1] or 'direct'}"
+                    )
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("no routes configured")
+
+    async def aclose(self) -> None:
+        for client in self._clients.values():
+            if not client.is_closed:
+                await client.aclose()
+        self._clients.clear()
+
+    async def __aenter__(self) -> "FailoverClient":
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        await self.aclose()
 
 
 # =========================================================================
@@ -369,23 +522,49 @@ def normalize_scopus(entry: dict, view: str = "STANDARD") -> dict:
     }
 
 
+# ── Scopus engine cooldown ────────────────────────────────────────────────
+#
+# When api.elsevier.com is unreachable from this host (no route, DNS dropped,
+# proxy misconfigured — observed here as ConnectTimeout), EVERY search paid the
+# connect timeout before falling back to OpenAlex, because each call re-tried
+# from scratch. The user-visible effect is that all literature search is slow
+# and the log fills with the same error, while the results are unaffected.
+#
+# So a TRANSPORT-level failure opens a short cooldown: for the next
+# _SCOPUS_COOLDOWN seconds Scopus is skipped outright and OpenAlex answers
+# alone. Only transport failures count — an HTTP 401/403/400 means the engine
+# answered and is worth asking again, and a per-query miss says nothing about
+# reachability. The first call after a cooldown expires always retries, so a
+# network that comes back is picked up within one window without a restart.
+_SCOPUS_COOLDOWN = 300.0
+_scopus_down_until = 0.0
+
+
+def _scopus_cooling() -> bool:
+    return time.monotonic() < _scopus_down_until
+
+
+def _scopus_transport_failed(exc: BaseException) -> None:
+    """Record a transport-level Scopus failure and start the cooldown."""
+    global _scopus_down_until
+    if isinstance(exc, (_httpx.TransportError, _httpx.TimeoutException)):
+        _scopus_down_until = time.monotonic() + _SCOPUS_COOLDOWN
+
+
 async def search_scopus(query: str, limit: int = 20, year: str = None,
-                        author: str = None, journal: str = None) -> list:
+                    author: str = None, journal: str = None) -> list:
     if not ELSEVIER_API_KEY:
+        return []
+    if _scopus_cooling():
+        _log("Scopus: skipped (unreachable recently; OpenAlex answers alone)")
         return []
 
     headers = {"X-ELS-APIKey": ELSEVIER_API_KEY, "Accept": "application/json"}
-    if ELSEVIER_INSTTOKEN:
-        headers["X-ELS-Insttoken"] = ELSEVIER_INSTTOKEN
 
-    # One proxy knob, shared with academic-mcp: DOWNLOAD_PROXY. Empty (or an
-    # explicit "none"/"off") means a direct connection, ignoring ambient
-    # *_proxy variables.
-    proxy_config = {}
-    if DOWNLOAD_PROXY and DOWNLOAD_PROXY.lower() not in ("none", "off", "false", "0"):
-        proxy_config["proxy"] = DOWNLOAD_PROXY
-    else:
-        proxy_config["trust_env"] = False
+    # Route chain: DOWNLOAD_PROXY when configured, else direct; in failover
+    # mode a transport failure retries through DOWNLOAD_PROXY. Ambient
+    # *_proxy variables are never inherited — routing is explicit.
+    routes = _scopus_routes()
 
     # Build structured Scopus query when author/journal filters are provided
     parts = []
@@ -411,12 +590,13 @@ async def search_scopus(query: str, limit: int = 20, year: str = None,
 
     # Attempt 1: COMPLETE view (max 25 results per page)
     complete_params = {**params, "view": "COMPLETE", "count": min(limit, 25), "start": 0}
-    async with httpx.AsyncClient(
+    async with FailoverClient(
+        routes, ns="scopus",
         base_url=SCOPUS_SEARCH_URL, headers={**headers, **_http_headers()},
-        **_client_kwargs(), **proxy_config,
+        **_scopus_client_kwargs(),
     ) as client:
         try:
-            resp = await _with_retry(client.get)("", params=complete_params)
+            resp = await client.get("", params=complete_params)
             if resp.status_code == 200:
                 data = resp.json()
                 entries = _scopus_real_entries(data)
@@ -430,13 +610,15 @@ async def search_scopus(query: str, limit: int = 20, year: str = None,
                 _log(f"Scopus HTTP {resp.status_code}: {resp.text[:200]}")
                 return []
         except Exception as e:
-            _log(f"Scopus COMPLETE error: {e}")
+            _log(f"Scopus COMPLETE error: {type(e).__name__}: {e!r}")
+            _scopus_transport_failed(e)
 
     # Attempt 2: STANDARD view (COMPLETE rejected or errored — try with lighter auth)
     standard_params = {**params, "view": "STANDARD", "count": min(limit, 200), "start": 0}
-    async with httpx.AsyncClient(
+    async with FailoverClient(
+        routes, ns="scopus",
         base_url=SCOPUS_SEARCH_URL, headers={**headers, **_http_headers()},
-        **_client_kwargs(), **proxy_config,
+        **_scopus_client_kwargs(),
     ) as client2:
         try:
             resp = await client2.get("", params=standard_params)
@@ -461,19 +643,19 @@ async def search_scopus(query: str, limit: int = 20, year: str = None,
 
             return results
         except Exception as e:
-            _log(f"Scopus STANDARD error: {e}")
+            _log(f"Scopus STANDARD error: {type(e).__name__}: {e!r}")
+            _scopus_transport_failed(e)
             return []
 
 
 async def _fetch_scopus_abstract(doi: str) -> str | None:
     headers = {"X-ELS-APIKey": ELSEVIER_API_KEY, "Accept": "application/json"}
-    if ELSEVIER_INSTTOKEN:
-        headers["X-ELS-Insttoken"] = ELSEVIER_INSTTOKEN
-    async with httpx.AsyncClient(
+    async with FailoverClient(
+        _scopus_routes(), ns="scopus",
         headers={**headers, **_http_headers()}, **_client_kwargs(),
     ) as client:
         try:
-            resp = await _with_retry(client.get)(f"{SCOPUS_ABSTRACT_URL}/{doi}")
+            resp = await client.get(f"{SCOPUS_ABSTRACT_URL}/{doi}")
             if resp.status_code == 200:
                 data = resp.json()
                 ar = data.get("abstracts-retrieval-response", {})
@@ -531,32 +713,35 @@ async def search_scopus_by_doi(doi: str) -> dict | None:
     """
     if not ELSEVIER_API_KEY:
         return None
+    if _scopus_cooling():
+        _log("Scopus: DOI lookup skipped (unreachable recently; OpenAlex answers alone)")
+        return None
 
     clean_doi = doi.replace("https://doi.org/", "").strip()
     headers = {"X-ELS-APIKey": ELSEVIER_API_KEY, "Accept": "application/json"}
-    if ELSEVIER_INSTTOKEN:
-        headers["X-ELS-Insttoken"] = ELSEVIER_INSTTOKEN
 
-    async with httpx.AsyncClient(
+    async with FailoverClient(
+        _scopus_routes(), ns="scopus",
         base_url=SCOPUS_SEARCH_URL, headers={**headers, **_http_headers()},
-        **_client_kwargs(),
+        **_scopus_client_kwargs(),
     ) as client:
         try:
             # COMPLETE view first: carries the abstract + full author list
-            resp = await _with_retry(client.get)("", params={"query": f"DOI({clean_doi})", "view": "COMPLETE", "count": 1})
+            resp = await client.get("", params={"query": f"DOI({clean_doi})", "view": "COMPLETE", "count": 1})
             if resp.status_code == 200:
                 entries = _scopus_real_entries(resp.json())
                 if entries:
                     return normalize_scopus(entries[0], "COMPLETE")
             # Fallback: STANDARD view (authors only, no abstract) — e.g.
             # key without COMPLETE permission (401/403) or empty result
-            resp2 = await _with_retry(client.get)("", params={"query": f"DOI({clean_doi})", "view": "STANDARD", "count": 1})
+            resp2 = await client.get("", params={"query": f"DOI({clean_doi})", "view": "STANDARD", "count": 1})
             if resp2.status_code == 200:
                 entries = _scopus_real_entries(resp2.json())
                 if entries:
                     return normalize_scopus(entries[0])
         except Exception as e:
-            _log(f"Scopus DOI lookup error: {e}")
+            _log(f"Scopus DOI lookup error: {type(e).__name__}: {e!r}")
+            _scopus_transport_failed(e)
     return None
 
 
@@ -612,7 +797,7 @@ def normalize_openalex(work: dict) -> dict:
 async def _resolve_openalex_source_id(journal_name: str, client: httpx.AsyncClient) -> str | None:
     """Resolve a journal name to an OpenAlex source ID via /sources search."""
     try:
-        resp = await _with_retry(client.get)("/sources", params={"search": journal_name, "per_page": 3})
+        resp = await client.get("/sources", params={"search": journal_name, "per_page": 3})
         resp.raise_for_status()
         results = resp.json().get("results", [])
         if results:
@@ -642,10 +827,10 @@ async def search_openalex(query: str, limit: int = 20, year: str | None = None,
         filters.append(f"doi:{doi}")
         _log(f"OpenAlex DOI lookup: {doi}")
 
-    proxy = GFW_PROXY if GFW_PROXY else None
-    async with httpx.AsyncClient(
+    async with FailoverClient(
+        _openalex_routes(), ns="openalex",
         base_url=OPENALEX_BASE, headers=_http_headers(),
-        **_client_kwargs(), proxy=proxy,
+        **_client_kwargs(),
     ) as client:
         # Journal: resolve name → source ID
         source_id: str | None = None
@@ -667,7 +852,7 @@ async def search_openalex(query: str, limit: int = 20, year: str | None = None,
             params["api_key"] = OPENALEX_API_KEY
 
         try:
-            resp = await _with_retry(client.get)("/works", params=params)
+            resp = await client.get("/works", params=params)
             resp.raise_for_status()
             # P0-12 修复：truncated JSON 静默吞问题。用 _safe_json 明示区分
             data = _safe_json(resp)
@@ -680,7 +865,7 @@ async def search_openalex(query: str, limit: int = 20, year: str | None = None,
         except _httpx.HTTPStatusError as e:
             _log(f"OpenAlex HTTP {e.response.status_code}")
             return []
-        except (_httpx.ConnectError, _httpx.ReadTimeout) as e:
+        except _httpx.TransportError as e:
             _log(f"OpenAlex network error: {type(e).__name__}: {e}")
             return []
         except Exception as e:
@@ -862,13 +1047,13 @@ async def _fetch_openalex_doi(doi: str) -> dict | None:
     clean_doi = doi.replace("https://doi.org/", "").replace("http://doi.org/", "").strip()
     if not clean_doi:
         return None
-    proxy = GFW_PROXY if GFW_PROXY else None
-    async with httpx.AsyncClient(
+    async with FailoverClient(
+        _openalex_routes(), ns="openalex",
         base_url=OPENALEX_BASE, headers=_http_headers(),
-        **_client_kwargs(), proxy=proxy,
+        **_client_kwargs(),
     ) as client:
         try:
-            resp = await _with_retry(client.get)("/works", params={"filter": f"doi:{clean_doi.lower()}", "per_page": 1})
+            resp = await client.get("/works", params={"filter": f"doi:{clean_doi.lower()}", "per_page": 1})
             if resp.status_code == 200:
                 entries = resp.json().get("results", [])
                 if entries:
@@ -876,6 +1061,451 @@ async def _fetch_openalex_doi(doi: str) -> dict | None:
         except Exception:
             pass
     return None
+
+
+# ── resolving a work from a partial citation ─────────────────────────────
+#
+# A user (or a draft's bibliography) usually names a paper the way a human
+# would — "the Xu 2021 Continuous Mott transition paper, Nature" — not by DOI.
+# Everything below turns that into either one confident DOI or a short list to
+# choose from. It NEVER invents one: a wrong DOI is worse than a question,
+# because every later step (download, citation, bibliography) treats the DOI as
+# ground truth and nothing downstream can tell it was a guess.
+
+#: Title-similarity floor for accepting a candidate as THE work.
+#:
+#: Two floors, because an author match is independent evidence. With one, a
+#: near-miss title is enough: `SequenceMatcher` puts unrelated papers in the same
+#: field at 0.85–0.9 surprisingly often ("...in twisted bilayer graphene" vs
+#: "...in twisted bilayer WSe2"), and a title-only citation carries no second
+#: signal to break the tie. Without one, the bar rises.
+_TITLE_MATCH_STRICT = 0.92
+_TITLE_MATCH_LOOSE = 0.97
+
+
+def _title_similarity(a: str, b: str) -> float:
+    """How close two titles are, in [0, 1]; case- and punctuation-insensitive.
+
+    Edit-distance similarity, with containment left to :func:`_title_containment`.
+    The two are deliberately separate because they fail in opposite directions:
+    similarity is high for a title plus a short suffix (a small edit) AND high
+    for two near-identical-but-different works, while containment is the only
+    thing that can tell a FULL title apart from a FRAGMENT of one. Collapsing
+    them into one number is what let a truncated query ("Continuous Mott
+    transition") score as confidently as the whole title.
+    """
+    def norm(text: str) -> str:
+        return re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower()).strip()
+
+    left, right = norm(a), norm(b)
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    return difflib.SequenceMatcher(None, left, right).ratio()
+
+
+#: Words that turn a title into a variant of itself rather than a different
+#: work. A title plus one of these (and little else) is still the same paper.
+_TITLE_MARKERS = (
+    "reply", "corrigendum", "erratum", "retraction", "comment", "addendum",
+    "publisher correction", "author correction", "editorial expression",
+)
+#: How much text a marker may carry with it. Enough for `: a reply to Xu et al`,
+#: not enough for a second clause that narrows the work.
+_TITLE_MARKER_MAX_EXTRA = 40
+
+#: Lowest title similarity a hit must reach to be offered as a CANDIDATE.
+#: `search_by_title`'s output is not a ranking, it is a question put to the
+#: caller ("which of these is it?"), so a hit that is merely the engine's best
+#: fuzzy match must not be in it. Measured on this corpus the separation is
+#: wide: a correct title scores 1.000, and every unrelated hit — papers about
+#: photocatalysts, memristors, heat transport — landed in 0.13-0.44. 0.60 sits
+#: in that empty band. Below it, `resolve_work` reports an honest miss, which is
+#: a better answer than a list nobody can choose from.
+TITLE_CANDIDATE_MIN_SIMILARITY = 0.60
+
+
+def _title_key(title: str) -> str:
+    """Normalised title, for deciding whether two records are the SAME work.
+
+    Lowercased, punctuation and whitespace collapsed. Used to dedup a candidate
+    list, where the identity that matters is the work and not the identifier:
+    one index may return a record with no DOI while another returns the same
+    paper with one, and both must occupy a single slot.
+    """
+    return re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
+
+
+def _title_suffix_is_marker(query: str, candidate: str) -> bool:
+    """Whether the candidate is the query plus a variant marker, not a superset.
+
+    This is the check that tells a COMPLETE title from a FRAGMENT of one, which
+    containment alone cannot: "Continuous Mott transition" and "Continuous Mott
+    transition in semiconductor moiré superlattices: a reply to Xu" are both
+    substrings of some published title, so both look "contained". What separates
+    them is what is left over — a fragment leaves the identifying tail of the
+    real title unaccounted for, while a variant leaves only a marker.
+    """
+    import re
+
+    def norm(text: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower())).strip()
+
+    left, right = norm(query), norm(candidate)
+    if not left or not right:
+        return False
+    if right == left:
+        return True
+    # Only the case where the candidate says MORE than the caller asked about.
+    if left not in right:
+        return False
+    extra = right.replace(left, " ", 1).strip()
+    if not extra or len(extra) > _TITLE_MARKER_MAX_EXTRA:
+        return False
+    return any(marker in extra for marker in _TITLE_MARKERS)
+
+
+def _surname(name: str) -> str:
+    """Best-effort surname from the spellings the engines actually return.
+
+    Those are `Sun J.Y.`, `Kaur P.`, `Rahul` — a surname FIRST with initials
+    after it, not the `First Last` order Western names are usually written in.
+    Taking the last token therefore returned an initial for two of those three,
+    so an author the caller named ("Xu") matched nobody and every candidate was
+    rejected. The rule below reads the first token that is not an initial.
+    """
+    import re
+
+    text = (name or "").strip()
+    if not text:
+        return ""
+    if "," in text:  # `Last, First` — the committed answer is before the comma
+        return text.split(",", 1)[0].strip().lower()
+    for token in text.split():
+        # An initial is a single letter, optionally followed by `.` and/or more
+        # single letters (`J.Y.`). Anything longer is a name.
+        if re.fullmatch(r"[A-Za-z](?:\.[A-Za-z])*\.?", token):
+            continue
+        return token.strip(".").lower()
+    return ""
+
+
+def _author_matches(paper: dict, author: str) -> bool:
+    """Whether ``author`` names any author of ``paper`` (surname containment)."""
+    want = _surname(author)
+    if not want:
+        return False
+    for entry in paper.get("authors") or []:
+        name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
+        if want and want in _surname(name):
+            return True
+    return False
+
+
+def _compact_candidate(paper: dict) -> dict:
+    """The four fields a caller needs to show a paper to a human and pick one."""
+    return {
+        "doi": paper.get("doi") or "",
+        "title": paper.get("title") or "",
+        "authors": [
+            a.get("name", "") if isinstance(a, dict) else str(a)
+            for a in (paper.get("authors") or [])
+        ],
+        "year": paper.get("year"),
+        "venue": paper.get("venue") or "",
+    }
+
+
+async def search_openalex_by_title(title: str, limit: int = 10) -> list[dict[str, Any]]:
+    """OpenAlex works whose TITLE matches ``title``.
+
+    `search_by_title` used to send a title through the keyword search, which
+    searches title AND abstract. For a title that is the wrong field: measured
+    here, the query "Continuous Mott transition" returned five papers about
+    photocatalysts and memristors — the engine ranked topical relevance over the
+    title — and the paper actually being sought did not appear at all, because
+    the engine's top N is not the caller's ranking rule.
+
+    ``filter=title.search:`` matches the title field alone, which is what a
+    citation lookup means. The engine is still asked for more rows than the
+    caller wants: matching is not ranking, and `resolve_work` re-scores by
+    similarity anyway.
+    """
+    clean = str(title or "").strip()
+    if not clean:
+        return []
+    params: dict = {
+        "filter": f"title.search:{clean},type:article|review",
+        "per_page": max(1, min(int(limit or 10), 50)),
+    }
+    if OPENALEX_API_KEY:
+        params["api_key"] = OPENALEX_API_KEY
+    proxy = GFW_PROXY if GFW_PROXY else None
+    async with httpx.AsyncClient(
+        base_url=OPENALEX_BASE, headers=_http_headers(),
+        **_client_kwargs(), proxy=proxy,
+    ) as client:
+        try:
+            resp = await _with_retry(client.get)("/works", params=params)
+            resp.raise_for_status()
+            data = _safe_json(resp)
+            if data.get("_truncated"):
+                _log("OpenAlex title search returned truncated JSON; skipping")
+                return []
+            return [normalize_openalex(w) for w in data.get("results", [])[:limit]]
+        except Exception as e:
+            _log(f"OpenAlex title search failed: {type(e).__name__}: {e!r}")
+            return []
+
+
+async def search_scopus_by_title(title: str, limit: int = 10,
+                                 author: str | None = None,
+                                 journal: str | None = None) -> list[dict[str, Any]]:
+    """Scopus entries whose ``TITLE()`` matches ``title``.
+
+    Same reasoning as :func:`search_openalex_by_title`: the relevance-ranked
+    keyword query is the wrong instrument for "which paper IS this", and Scopus
+    has a field code for the right one.
+    """
+    clean = str(title or "").strip()
+    if not clean or not ELSEVIER_API_KEY:
+        return []
+    if _scopus_cooling():
+        _log("Scopus: title search skipped (unreachable recently)")
+        return []
+
+    parts = [f"TITLE({clean})"]
+    if author:
+        parts.append(f"AUTHOR-NAME({author})")
+    if journal:
+        parts.append(f"SRCTITLE({journal})")
+    headers = {"X-ELS-APIKey": ELSEVIER_API_KEY, "Accept": "application/json"}
+    params = {
+        "query": " AND ".join(parts),
+        "view": "STANDARD",
+        "count": max(1, min(int(limit or 10), 25)),
+    }
+    async with httpx.AsyncClient(
+        base_url=SCOPUS_SEARCH_URL, headers={**headers, **_http_headers()},
+        **_scopus_client_kwargs(),
+    ) as client:
+        try:
+            resp = await _with_retry(client.get)("", params=params)
+            if resp.status_code != 200:
+                _log(f"Scopus title search HTTP {resp.status_code}")
+                return []
+            entries = _scopus_real_entries(resp.json())
+            return [normalize_scopus(e, "STANDARD") for e in entries[:limit]]
+        except Exception as e:
+            _log(f"Scopus title search error: {type(e).__name__}: {e!r}")
+            _scopus_transport_failed(e)
+            return []
+
+
+async def search_by_title(title: str, author: str = "", journal: str = "",
+                          limit: int = 5) -> list[dict]:
+    """Find papers by title (+ optional author/journal), best match first.
+
+    Three sources, deliberately: each engine's TITLE() field match, which is
+    precise but varies between indexes (Scopus abbreviates, OpenAlex stores the
+    published form, and either may carry a subtitle the caller omitted), plus the
+    keyword search as a recall net for a title spelled differently in both.
+
+    It does NOT judge which hit is the right paper, and it does not return every
+    hit: candidates below :data:`TITLE_CANDIDATE_MIN_SIMILARITY` are dropped
+    here, because the caller turns this list into a question. The run that
+    prompted this returned five photocatalysis papers scoring 0.13-0.20 as
+    "candidates" for a moiré-physics title, and a caller shown that list can only
+    choose a wrong answer.
+    """
+    query = str(title or "").strip()
+    if not query:
+        return []
+    want = max(1, min(int(limit or 5), 20))
+
+    # Ask every source for more than the caller wants: matching is not ranking.
+    pool = max(want * 3, 10)
+    batches = await asyncio.gather(
+        search_scopus_by_title(query, pool, author=author or None, journal=journal or None),
+        search_openalex_by_title(query, pool),
+        search_openalex(query, pool, author=author or None, journal=journal or None),
+        return_exceptions=True,
+    )
+
+    # Dedup by NORMALISED TITLE, not by DOI. Keying on the DOI made the same
+    # work appear twice whenever one index returned the record without one —
+    # observed here as Scopus' DOI-less "Continuous Mott transition in
+    # semiconductor moire superlattices" sitting next to OpenAlex' DOI-bearing
+    # record at similarity 0.984. Both entries are the same paper, and offering
+    # them as two choices asks the caller to pick between identical things.
+    by_title: dict[str, dict] = {}
+    for batch in batches:
+        if isinstance(batch, BaseException) or not batch:
+            continue
+        for paper in batch:
+            title_key = _title_key(paper.get("title") or "")
+            if not title_key:
+                # No title to judge it by: keep a DOI'd record only.
+                title_key = (paper.get("doi") or "").strip().lower()
+                if not title_key:
+                    continue
+            existing = by_title.get(title_key)
+            # Prefer the richer record: a DOI is what makes the paper
+            # downloadable, so an entry that has one wins the slot.
+            if existing is None or (
+                not (existing.get("doi") or "").strip() and (paper.get("doi") or "").strip()
+            ):
+                by_title[title_key] = paper
+
+    scored: list[tuple[float, dict]] = []
+    for paper in by_title.values():
+        score = _title_similarity(query, paper.get("title") or "")
+        if score < TITLE_CANDIDATE_MIN_SIMILARITY:
+            continue
+        scored.append((score, paper))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [paper for _, paper in scored[:want]]
+
+
+async def resolve_work(doi: str = "", title: str = "", author: str = "",
+                       journal: str = "") -> dict:
+    """Resolve whatever the caller has into ONE work, or a list to choose from.
+
+    Returns ``{"ok": True, "resolved": True, "paper": {...}}`` when exactly one
+    candidate is confidently the work, ``{"ok": True, "resolved": False,
+    "candidates": [...]}`` when the answer is ambiguous, and ``{"ok": False,
+    "error": ...}`` when nothing was found.
+
+    A DOI short-circuits everything: it is an IDENTIFIER, not a search, so its
+    metadata is authoritative and it is never compared against a title. Rejecting
+    a DOI because its title disagrees with the caller's would refuse the one
+    input that cannot be wrong.
+
+    PURE resolver, like :func:`lookup_doi` — no cache write, no download. Every
+    caller decides for itself what a resolution authorises.
+    """
+    clean_doi = str(doi or "").strip()
+    if clean_doi:
+        paper = await lookup_doi(clean_doi)
+        if paper is None:
+            return {
+                "ok": False,
+                "doi": clean_doi,
+                "error": f"no metadata for DOI {clean_doi}",
+                "hint": "The DOI may be mistyped, or the work may not be indexed "
+                        "by Scopus/OpenAlex. Check it against the source you took it from.",
+            }
+        return {"ok": True, "resolved": True, "paper": _compact_candidate(paper),
+                "matched_by": "doi"}
+
+    clean_title = str(title or "").strip()
+    if not clean_title:
+        return {
+            "ok": False,
+            "error": "a DOI or a title is required",
+            "hint": "Pass a DOI when it is known — it is the only form that cannot "
+                    "be misread. A title alone works but may return candidates.",
+        }
+
+    candidates = await search_by_title(clean_title, author=author, journal=journal)
+    # Rank by TITLE SIMILARITY, not by the engines' own relevance order. Theirs
+    # answers "what is about this topic"; a citation lookup asks "which of these
+    # IS this paper", and the two disagree exactly when the title is imprecise —
+    # the case this resolver exists for.
+    for paper in candidates:
+        paper["_title_score"] = _title_similarity(clean_title, paper.get("title") or "")
+        paper["_title_exact"] = _title_suffix_is_marker(clean_title, paper.get("title") or "")
+        paper["_author_match"] = _author_matches(paper, author) if author else False
+    candidates.sort(key=lambda p: (p["_title_score"], p["_author_match"]), reverse=True)
+    if not candidates:
+        return {
+            "ok": False,
+            "title": clean_title,
+            "error": "no paper found for that title",
+            "hint": "Retry with the exact published title, or add author/journal. "
+                    "If it is still not found, search for the topic instead.",
+        }
+
+    # A confident single answer needs THREE things, and the third is the one
+    # that stops a guess: the query must be the whole title (coverage), not a
+    # fragment of one. Then, with an author given, that author must be on the
+    # paper — a named author who matches nobody is evidence AGAINST the
+    # candidate, not neutral, because the caller told us who wrote it.
+    def confident(paper: dict) -> bool:
+        score = paper.get("_title_score") or 0.0
+        if not _titles_match(clean_title, paper.get("title") or ""):
+            return False
+        # The query must BE the title (or the title plus a variant marker). A
+        # query that is only part of it leaves the identifying tail unread, and
+        # every candidate sharing that opening would qualify.
+        if not paper.get("_title_exact"):
+            return False
+        # The author is consulted BEFORE the score shortcut. Checking the score
+        # first let an exact title with a mismatched author resolve anyway — the
+        # caller had named who wrote the paper, so a candidate they are not on is
+        # evidence against it, not a detail the title can overrule.
+        if author and not paper.get("_author_match"):
+            return False
+        if score >= _TITLE_MATCH_LOOSE:
+            return True
+        if author:
+            # With the author confirmed, a looser title match is enough: an
+            # independent identifier agreeing with an imperfect title is
+            # stronger evidence than a perfect title alone.
+            return score >= _TITLE_MATCH_STRICT
+        return False
+
+    def is_variant(query: str, candidate_title: str) -> bool:
+        """True when the candidate is the query PLUS a marker — i.e. a reply,
+        corrigendum or erratum, which is a DIFFERENT work.
+
+        Both the marker and the fact that the candidate says more are required.
+        A marker alone would flag a paper whose title merely opens with the
+        query's words; extra text alone would flag any superset. Together they
+        name the one case the resolver must not answer with: the user asked for
+        the paper and got its rebuttal.
+        """
+        import re
+
+        def norm(text: str) -> str:
+            return re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower()).strip()
+
+        left, right = norm(query), norm(candidate_title)
+        if not left or not right or left == right or left not in right:
+            return False
+        extra = right.replace(left, " ", 1).strip()
+        return any(marker in extra for marker in _TITLE_MARKERS)
+
+    top = candidates[0]
+    # A reply/corrigendum is a different work, so answering the base title with
+    # it would be wrong even though the title "contains" the query. Hand back
+    # the choice instead of silently preferring one.
+    if is_variant(clean_title, top.get("title") or ""):
+        return {
+            "ok": True,
+            "resolved": False,
+            "title": clean_title,
+            "candidates": [_compact_candidate(p) for p in candidates[:5]],
+        }
+    if confident(top):
+        return {
+            "ok": True,
+            "resolved": True,
+            "paper": _compact_candidate(top),
+            "matched_by": "title",
+            "title_score": round(top.get("_title_score") or 0.0, 3),
+        }
+
+    # Not confident: hand back what was found and let a human choose. Picking the
+    # top hit here is exactly the guess this function exists to refuse.
+    return {
+        "ok": True,
+        "resolved": False,
+        "title": clean_title,
+        "candidates": [_compact_candidate(p) for p in candidates[:5]],
+    }
 
 
 async def lookup_doi(doi: str) -> dict | None:
@@ -1008,6 +1638,13 @@ def save_search_cache(papers: list, query: str, session_id: str = ""):
     writers leave only 1 of 4 updates.)
     """
     session_id = session_id or _get_session_id()
+    # The cache path is `<dir>/<sid>.json`, so the id is a filename: it goes
+    # through the same guard `validate.check` uses. Otherwise a malformed id is
+    # WRITTEN under one name and READ under another, and the mismatch reaches
+    # the caller as "this DOI was never searched" -- the opposite of the truth.
+    from .memory import normalise_session_id
+
+    session_id = normalise_session_id(session_id)
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(CACHE_DIR, f"{session_id}.json")
 

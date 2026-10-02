@@ -15,8 +15,10 @@ so DOIs returned here pass academic_import_papers DOI validation — they can be
 downloaded directly without re-searching.
 
 Environment:
-  GFW_PROXY          Proxy for OpenAlex when behind GFW (also accepted as --proxy)
-  OPENALEX_API_KEY   Optional OpenAlex premium key
+  GFW_PROXY              Primary proxy for OpenAlex when behind GFW (also --proxy)
+  DOWNLOAD_PROXY_MODE    failover adds a rescue route on transport failure
+  DOWNLOAD_PROXY          Rescue route for failover mode
+  OPENALEX_API_KEY       Optional OpenAlex premium key
 
 P2-12: proxy is env-configurable (GFW_PROXY) AND has a --proxy CLI flag.
 Previously the audit noted "proxies hardcoded disable" — this was incorrect,
@@ -41,9 +43,11 @@ except ImportError:
 # Reuse normalization + search-cache logic from search.py (same directory)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from .search import (  # noqa: E402
+    FailoverClient,
     _client_kwargs,
     _http_headers,
     _log,
+    _route_chain,
     normalize_openalex,
     save_search_cache,
 )
@@ -78,11 +82,11 @@ def _get_sem() -> asyncio.Semaphore:
         _SNOWBALL_SEM = asyncio.Semaphore(_SNOWBALL_CONCURRENCY)
     return _SNOWBALL_SEM
 # P2-12: keep env var name GFW_PROXY for backward compat, but the value is now
-# overridable per-invocation via --proxy. An unset / empty value leaves httpx
-# to honour the system HTTP_PROXY / HTTPS_PROXY (trust_env defaults to True),
-# which is the correct behaviour for users behind a GFW who already set the
-# standard env vars. To explicitly disable, set GFW_PROXY="none" or pass
-# --proxy=none.
+# overridable per-invocation via --proxy. An empty / "none" value means a
+# direct connection — routing is explicit and ambient *_proxy variables are
+# never inherited (FailoverClient pins trust_env=False). In failover mode a
+# transport failure on the primary route retries through DOWNLOAD_PROXY,
+# the same rescue hop the search engines use.
 from ..config import settings as _settings  # noqa: E402  (after the module docstring block)
 
 GFW_PROXY = _settings.gfw_proxy or ""
@@ -166,12 +170,12 @@ async def snowball(seeds: list[str], direction: str, limit: int, proxy: str = ""
     # raises TypeError on every modern httpx — citation chaining was dead.)
     # P2-12: prefer the explicit argument, fall back to GFW_PROXY env.
     effective_proxy = (proxy or GFW_PROXY or "").strip()
-    proxy_arg = {}
-    if effective_proxy and effective_proxy.lower() != "none":
-        proxy_arg = {"proxy": effective_proxy}
-    async with httpx.AsyncClient(
+    if effective_proxy.lower() == "none":
+        effective_proxy = ""
+    async with FailoverClient(
+        _route_chain(effective_proxy or None), ns="openalex",
         base_url=OPENALEX_BASE, headers=_http_headers(),
-        **_client_kwargs(), **proxy_arg,
+        **_client_kwargs(),
     ) as client:
         # 1. Resolve seeds (P1-T: parallel via asyncio.gather)
         seed_works = await asyncio.gather(

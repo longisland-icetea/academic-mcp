@@ -114,7 +114,10 @@ DEFAULT_SESSION = "default"
 # papers get backfilled per recall call, and remember the outcome so we
 # never re-query a DOI we already resolved (or already failed to resolve).
 _META_FETCH_LIMIT = 3
-_META_FETCH_TIMEOUT = 25  # seconds
+_META_FETCH_TIMEOUT = 25  # seconds, per DOI
+# Total wall-clock budget for enrichment inside one `get`. Enrichment shells out
+# once per DOI; unbounded it could hold the answer for minutes.
+_META_FETCH_BUDGET = 12.0  # seconds
 
 
 def session_key_for_cwd(cwd: str) -> str:
@@ -146,6 +149,71 @@ def get_session_id() -> str:
         return session_key_for_cwd(os.getcwd())
     except OSError:
         return DEFAULT_SESSION
+
+
+# A session id is a filename (`<data_dir>/<sid>.json`,
+# `<search_cache_dir>/<sid>.json`), so an unchecked one is a traversal hole:
+# `../../etc/passwd` would read and write outside both directories. The guard
+# below is therefore about PATHS, not about which characters a key may contain.
+#
+# It deliberately does NOT restrict the body to `[A-Za-z0-9._-]`. That was the
+# original rule, copied from pi's ids, and it rejected every key derived from a
+# non-ASCII directory: a cwd of `/mnt/c/Users/Sync/郑州大学/8.重点研发` encodes to
+# `--mnt-c-Users-Sync-郑州大学-8.重点研发--`, which the rule dropped to
+# "default" -- so `validate.check` looked for the caller's DOI in
+# `search_cache/default.json` while `save_search_cache` had written it to
+# `search_cache/--mnt-c-Users-Sync-郑州大学-8.重点研发--.json`. Every import in
+# such a project was then refused with "尚未在本会话内授权下载" for a DOI that
+# was in the session's own cache, and the client-side checks that read the same
+# key (cwd → memory file → search cache) all saw the other spelling.
+#
+# What the encoding rule actually guarantees: a key is `--<body>--`, and
+# `session_key_for_cwd` produces <body> by replacing every `/` with `-`, so a
+# well-formed key contains no path separator, no `..`, and no control
+# character. Those three are exactly what is rejected here.
+def is_session_key(raw: str) -> bool:
+    """True when ``raw`` is a session key this service would itself generate.
+
+    Checks the shape (``--…--``) and then rejects the three things that would
+    let a key escape its directory or break a filename: a path separator, a
+    ``..`` segment, and a control character. Body characters are otherwise
+    unrestricted — a non-ASCII key is how a CJK project path encodes.
+    """
+    value = str(raw or "")
+    if len(value) > 200:
+        return False
+    if not (value.startswith("--") and value.endswith("--") and len(value) > 4):
+        return False
+    body = value[2:-2]
+    if "/" in body or "\\" in body or ".." in body:
+        return False
+    return not any(ord(ch) < 32 or ord(ch) == 127 for ch in body)
+
+
+def normalise_session_id(raw: str | None, *, logger: Any = None) -> str:
+    """The one place a caller-supplied session id becomes a path component.
+
+    Returns ``raw`` unchanged when it is a usable key, ``"default"`` when the
+    caller omitted it, and otherwise logs the refusal and returns ``"default"``.
+
+    Every entry point that turns a session id into a filename must go through
+    this: ``validate.check`` (the DOI allowlist), ``search.save_search_cache``
+    (the allowlist writer) and the memory tool ops. When only some of them did,
+    a malformed id was written under one name and read under another, and the
+    mismatch surfaced as a policy denial rather than as a bad key.
+    """
+    value = str(raw or "").strip()
+    if not value:
+        return DEFAULT_SESSION
+    if value == DEFAULT_SESSION or is_session_key(value):
+        return value
+    if logger is not None:
+        logger.warning(
+            "rejecting malformed session id %r; falling back to %r",
+            value,
+            DEFAULT_SESSION,
+        )
+    return DEFAULT_SESSION
 
 
 def get_memory_path(session_id: str) -> Path:
@@ -254,23 +322,37 @@ def _find_paper_idx(library: list[dict[str, Any]], paper_id: str, doi: str = "")
     return None
 
 
+def _full_text_path(paper_id: str) -> Path | None:
+    """Locate the cached markdown for ``paper_id`` without reading it.
+
+    Same two spellings `_read_full_text` tries — the underscored `paper_id` and
+    the raw DOI — because a library written before the key rule settled may hold
+    either. Returning the PATH (not the text) is what lets a caller point `read`
+    at one section of a 70 KB paper instead of receiving the whole file.
+    """
+    if not paper_id:
+        return None
+    candidates = [TEXTS_DIR / f"{paper_id}.md"]
+    if "_" in paper_id:
+        candidates.append(TEXTS_DIR / f"{paper_id.replace('_', '/')}.md")
+    for path in candidates:
+        try:
+            if path.is_file():
+                return path
+        except OSError:
+            continue
+    return None
+
+
 def _read_full_text(paper_id: str) -> str | None:
     """Try to read cached full text from data/texts/{paper_id}.md."""
-    md_path = TEXTS_DIR / f"{paper_id}.md"
-    if md_path.exists():
-        try:
-            return md_path.read_text(encoding="utf-8")
-        except Exception:
-            pass
-    # Also try with different key formats (doi with slashes)
-    if "_" in paper_id:
-        alt_path = TEXTS_DIR / f"{paper_id.replace('_', '/')}.md"
-        if alt_path.exists():
-            try:
-                return alt_path.read_text(encoding="utf-8")
-            except Exception:
-                pass
-    return None
+    md_path = _full_text_path(paper_id)
+    if md_path is None:
+        return None
+    try:
+        return md_path.read_text(encoding="utf-8")
+    except Exception:
+        return None
 
 
 # ── Metadata enrichment via API (Scopus → OpenAlex) ──────────────────────
@@ -508,6 +590,57 @@ def cmd_update(memory: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "changes": changes}
 
 
+def cmd_stores(memory: dict[str, Any], field: str = "") -> dict[str, Any]:
+    """The project-level stores, optionally narrowed to one of them.
+
+    These four are what an `edit` targets when it is not aimed at a paper, so
+    reading them is the step before quoting one. `field` uses the SAME
+    vocabulary `cmd_edit` accepts, so a caller that can name what it wants to
+    change can name what it wants to read, with no second glossary:
+
+      ``research_goal``        one string
+      ``research_notes``       one string
+      ``key_findings``         a list of `{text, source_pids, confidence, …}`
+      ``unresolved_questions`` a list of `{question, timestamp}`
+
+    Each entry carries its index, because that is how a miss is diagnosed and
+    how a caller refers to one entry when reporting what it did. An empty
+    `field` returns all four, which is the "show me the project" case.
+    """
+    want = str(field or "").strip()
+    # Aliases, matching cmd_edit exactly: a caller that learned one name should
+    # not have to learn a second spelling for the same store.
+    aliases = {"finding": "key_findings", "unresolved": "unresolved_questions"}
+    want = aliases.get(want, want)
+
+    known = ("research_goal", "research_notes", "key_findings", "unresolved_questions")
+    if want and want not in known:
+        return {"status": "error", "error": f"unknown field {field!r}",
+                "hint": f"field is one of {', '.join(known)} (or omit it for all four)"}
+
+    def indexed(entries: list[Any], key: str) -> list[dict[str, Any]]:
+        out = []
+        for i, entry in enumerate(entries or []):
+            if not isinstance(entry, dict):
+                continue
+            out.append({"index": i, key: entry.get(key, "") or "",
+                        "confidence": entry.get("confidence"),
+                        "source_pids": entry.get("source_pids") or []})
+        return out
+
+    stores: dict[str, Any] = {}
+    if want in ("", "research_goal"):
+        stores["research_goal"] = memory.get("research_goal") or ""
+    if want in ("", "research_notes"):
+        stores["research_notes"] = memory.get("research_notes") or ""
+    if want in ("", "key_findings"):
+        stores["key_findings"] = indexed(memory.get("key_findings") or [], "text")
+    if want in ("", "unresolved_questions"):
+        stores["unresolved_questions"] = indexed(
+            memory.get("unresolved_questions") or [], "question")
+    return {"status": "ok", "field": want or "all", "stores": stores}
+
+
 def cmd_list(memory: dict[str, Any]) -> list[dict[str, Any]]:
     """Return all papers in library as a compact summary."""
     papers = memory.get("paper_library", [])
@@ -571,25 +704,50 @@ def cmd_get(memory: dict[str, Any], ids: list[str] | None = None, topic: str | N
     result_papers = []
     fetched = 0
     meta_updated = False
+    # Bound the enrichment as a WHOLE, not per paper. `_META_FETCH_LIMIT` caps
+    # the count at 3 and each subprocess gets `_META_FETCH_TIMEOUT` (25 s), so
+    # the worst case was 75 s of blocking network work inside a tool whose
+    # caller allows 90 s -- one slow Scopus day away from a timeout that says
+    # nothing about the papers. Enrichment is a nicety; the notes are the
+    # answer, so the loop stops enriching once the budget is spent and returns
+    # what it already has.
+    enrich_deadline = time.monotonic() + _META_FETCH_BUDGET
     for p in matched:
         pd = dict(p)
+        pid = p.get("paper_id", "")
+        # The cached full text lives at a FIXED, derivable path, and every
+        # caller that wants a section of it should read it with `read` +
+        # offset/limit rather than receive the whole file. Report where it is on
+        # BOTH branches, so "where is the markdown for this paper?" never has to
+        # be answered by guessing: a client that guessed
+        # `~/.cache/academic-mcp/doc-read/<doi>.md` (the doc_read cache, not the
+        # library) and handed that path to `present` got "file not found" for a
+        # paper that was in the library all along.
         pd["has_cached_full_text"] = False
+        text_path = _full_text_path(pid)
+        if text_path is not None:
+            pd["has_cached_full_text"] = True
+            pd["full_text_path"] = str(text_path)
+            pd["full_text_length"] = text_path.stat().st_size
         if include_full_text:
-            pid = p.get("paper_id", "")
             full_text = _read_full_text(pid)
             if full_text:
                 pd["full_text"] = full_text
-                pd["has_cached_full_text"] = True
-                pd["full_text_length"] = len(full_text)
             else:
                 pd["_hint"] = (
                     f"论文 '{pid}' 的全文缓存不存在。"
                     f"请先用 academic_import_papers 下载并阅读（academic_download 仅供 subagent 内部使用）。"
                 )
         else:
+            if not text_path:
+                pd["_hint"] = (
+                    f"论文 '{pid}' 已入库，但全文未缓存到磁盘（texts/{pid}.md 不存在）。"
+                    f"要用 academic_import_papers 重新下载，或在库里只用上面的笔记。"
+                )
             # Full author list + abstract via API, cached in the paper record
             # (meta_fetched guards against re-querying resolved/failed DOIs).
-            if fetched < _META_FETCH_LIMIT and not p.get("meta_fetched"):
+            if fetched < _META_FETCH_LIMIT and not p.get("meta_fetched") \
+                    and time.monotonic() < enrich_deadline:
                 meta = _fetch_doi_metadata(p.get("doi", ""))
                 if meta:
                     if meta.get("authors"):
@@ -646,6 +804,182 @@ def cmd_unresolved(memory: dict[str, Any], question: str) -> dict[str, Any]:
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     })
     return {"status": "ok", "question": question}
+
+
+def cmd_edit(memory: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    """Edit stored text in place, with the same rules as the `edit` tool.
+
+    Research notes are append-only and findings can only be added, so a wrong
+    note or a retracted conclusion could never be corrected — the only remedy
+    was to append another entry saying "the previous one is wrong", leaving both
+    in the record. This makes the stored text itself editable.
+
+    The contract mirrors dsh's `edit` tool deliberately, because that is the
+    behaviour a model already knows:
+
+      * `old_string` must be a non-empty string.
+      * `old_string` and `new_string` must differ — an equal pair is a
+        guaranteed no-op, so it is rejected rather than reported as success.
+      * A missing `old_string` is an error, never a silent no-op.
+      * Several matches are an error unless `replace_all` is true.
+      * `new_string: ""` deletes the match; that is how an entry is removed.
+
+    The target is named explicitly rather than guessed: a finding's text and the
+    project notes are different stores, and guessing which one a caller meant is
+    how the wrong thing gets rewritten.
+
+    Recognized `field` values:
+      ``research_notes``        the project's freeform notes (one string)
+      ``research_goal``         the one-sentence goal (one string)
+      ``key_findings``          the `text` of one finding
+      ``unresolved_questions``  the `question` of one entry
+      ``paper_field``           one field of one paper — also needs `paper_id`,
+                                and `value` names the field (`key_notes`,
+                                `detailed_notes`, `importance`, `title`, …).
+                                A LIST field (`key_excerpts`) matches each
+                                element separately, and an element that becomes
+                                empty is removed — that is how one excerpt is
+                                deleted, which the append-only update could
+                                never do.
+
+    With `field` omitted, the editable stores are searched in a fixed order and
+    the first one containing `old_string` is edited; the chosen store is named
+    in the result. Exactly one store is ever written per call.
+    """
+    old = data.get("old_string")
+    if not isinstance(old, str) or old == "":
+        return {"status": "error", "error": "old_string must be a non-empty string",
+                "hint": "read the exact text first (memory op=get), then copy it verbatim"}
+    new = data.get("new_string")
+    if new is None:
+        new = ""
+    if not isinstance(new, str):
+        return {"status": "error", "error": "new_string must be a string (use \"\" to delete the match)"}
+    if old == new:
+        return {"status": "error", "error": "old_string and new_string must differ",
+                "hint": "an equal pair would be a no-op edit; nothing was written"}
+    replace_all = bool(data.get("replace_all"))
+
+    field = str(data.get("field") or "").strip()
+    candidates: list[tuple[str, str]] = []   # (label, current text), in search order
+    writers: dict[str, Any] = {}             # label -> callable(new_text)
+
+    def add(label: str, text: Any, write) -> None:
+        # `writers` is populated here so a caller that edits `research_notes`
+        # into existence on an empty document still has a writer registered.
+        if isinstance(text, str):
+            candidates.append((label, text))
+            writers[label] = write
+
+    if field in ("", "research_notes"):
+        add("research_notes", memory.get("research_notes") or "",
+            lambda v: memory.__setitem__("research_notes", v))
+
+    if field in ("", "research_goal"):
+        add("research_goal", memory.get("research_goal") or "",
+            lambda v: memory.__setitem__("research_goal", v))
+
+    if field in ("", "key_findings", "finding"):
+        for i, entry in enumerate(memory.get("key_findings") or []):
+            if isinstance(entry, dict):
+                add(f"key_findings[{i}].text", entry.get("text") or "",
+                    lambda v, entry=entry: entry.__setitem__("text", v))
+
+    if field in ("", "unresolved_questions", "unresolved"):
+        for i, entry in enumerate(memory.get("unresolved_questions") or []):
+            if isinstance(entry, dict):
+                add(f"unresolved_questions[{i}].question", entry.get("question") or "",
+                    lambda v, entry=entry: entry.__setitem__("question", v))
+
+    if field in ("", "paper_field", "paper"):
+        pid = str(data.get("paper_id") or data.get("doi") or "").strip()
+        value_field = str(data.get("value") or data.get("paper_field") or "").strip()
+        if pid and value_field:
+            idx = _find_paper_idx(memory.get("paper_library", []), pid,
+                                  str(data.get("doi") or ""))
+            if idx is None:
+                return {"status": "error", "error": f"no paper matching {pid!r}",
+                        "hint": "memory op=list shows the paper ids in this project"}
+            paper = memory["paper_library"][idx]
+            if value_field not in paper:
+                return {"status": "error", "error": f"paper has no field {value_field!r}",
+                        "hint": f"fields: {', '.join(sorted(paper.keys()))}"}
+
+            current = paper.get(value_field)
+            if isinstance(current, list):
+                # `key_excerpts` is a LIST, and the update path could only ever
+                # append to it (with a dedupe), so a wrong or superseded excerpt
+                # was permanent. A list has no string body to search, so each
+                # element is matched on its own; an element that becomes empty is
+                # removed, which is how one excerpt is deleted.
+                if not all(isinstance(x, str) for x in current):
+                    return {"status": "error",
+                            "error": f"{value_field} is a list of non-strings; not editable",
+                            "hint": "only key_excerpts (a list of strings) is supported"}
+                hits = [i for i, x in enumerate(current) if old in x]
+                if not hits:
+                    return {"status": "error",
+                            "error": f"old_string was not found in {value_field} "
+                                     f"({len(current)} entr{'y' if len(current) == 1 else 'ies'})",
+                            "hint": "read the excerpts first (academic_paper_recall), then copy one verbatim"}
+                if len(hits) > 1 and not replace_all:
+                    return {"status": "error",
+                            "error": f"old_string matched {len(hits)} entries of {value_field}",
+                            "hint": "provide a more specific old_string, or set replace_all=true"}
+                targets = hits if replace_all else hits[:1]
+                # Preserve the original order of untouched entries; an entry
+                # whose text becomes empty is dropped, which is how a single
+                # excerpt is deleted.
+                kept = []
+                for i, x in enumerate(current):
+                    if i not in targets:
+                        kept.append(x)
+                    else:
+                        replaced = x.replace(old, new).strip()
+                        if replaced != "":
+                            kept.append(replaced)
+                paper[value_field] = kept
+                label = f"paper[{paper.get('paper_id', pid)}].{value_field}"
+                memory.setdefault("edit_history", []).append({
+                    "field": label, "replacements": len(targets),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                })
+                return {"status": "ok", "field": label,
+                        "replacements": len(targets), "remaining": len(kept)}
+
+            add(f"paper[{paper.get('paper_id', pid)}].{value_field}",
+                current or "",
+                lambda v, paper=paper, k=value_field: paper.__setitem__(k, v))
+
+    if not candidates:
+        return {"status": "error",
+                "error": f"nothing editable matched field={field!r}",
+                "hint": "field is one of research_notes / research_goal / key_findings / "
+                        "unresolved_questions / paper_field (the last also needs paper_id + value)"}
+
+    for label, text in candidates:
+        count = text.count(old)
+        if count == 0:
+            continue
+        if count > 1 and not replace_all:
+            return {"status": "error",
+                    "error": f"old_string matched {count} times in {label}",
+                    "hint": "provide a more specific old_string, or set replace_all=true"}
+        replacements = count if replace_all else 1
+        updated = text.replace(old, new)
+        writers[label](updated)
+        memory.setdefault("edit_history", []).append({
+            "field": label,
+            "replacements": replacements,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        return {"status": "ok", "field": label, "replacements": replacements,
+                "before": text if len(text) <= 2000 else text[:2000] + "…",
+                "after": updated if len(updated) <= 2000 else updated[:2000] + "…"}
+
+    return {"status": "error", "error": "old_string was not found in the searched fields",
+            "searched": [label for label, _ in candidates],
+            "hint": "read the current text first (memory op=get or op=list), then copy it exactly"}
 
 
 def _pid_key(value: Any) -> str:
@@ -1246,6 +1580,18 @@ def main():
     p_finding = sub.add_parser("finding", help="Add a key finding")
     p_finding.add_argument("data", help='JSON: {"text": "...", "source_pids": [...], "confidence": "..."}')
 
+    p_edit = sub.add_parser("edit",
+                            help="Edit stored text in place (edit-tool semantics: "
+                                 "exactly-one match unless --all; empty --new deletes)")
+    p_edit.add_argument("--old", required=True, help="Literal text to replace (must be non-empty)")
+    p_edit.add_argument("--new", default="", help="Replacement text; empty deletes the match")
+    p_edit.add_argument("--field", default="",
+                        help="research_notes / research_goal / key_findings / "
+                             "unresolved_questions / paper_field (default: search in that order)")
+    p_edit.add_argument("--paper-id", default="", help="With --field paper_field: which paper")
+    p_edit.add_argument("--value", default="", help="With --field paper_field: which field of it")
+    p_edit.add_argument("--all", action="store_true", help="Replace every match, not exactly one")
+
     p_unresolved = sub.add_parser("unresolved", help="Add an unresolved question")
     p_unresolved.add_argument("text", help="Question text")
 
@@ -1253,6 +1599,13 @@ def main():
                            help="Remove one paper plus its topic/finding references")
     p_del.add_argument("--id", required=True, help="paper_id (underscored) or DOI")
     p_del.add_argument("--doi", default="", help="DOI, when --id is something else")
+
+    p_stores = sub.add_parser("stores",
+                              help="The project-level stores only (goal / notes / findings / "
+                                   "unresolved) — what an edit targets; --field narrows to one")
+    p_stores.add_argument("--field", default="",
+                          help="research_goal / research_notes / key_findings / "
+                               "unresolved_questions (default: all four)")
 
     sub.add_parser("dump", help="Dump full memory state")
     p_wm = sub.add_parser("working-memory", help="Output formatted working memory block for system prompt")
@@ -1314,6 +1667,24 @@ def main():
         save_memory(session_id, memory)
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
+    elif args.command == "edit":
+        result = cmd_edit(memory, {
+            "old_string": args.old,
+            "new_string": args.new,
+            "field": args.field,
+            "paper_id": args.paper_id,
+            "value": args.value,
+            "replace_all": bool(args.all),
+        })
+        # Save only on success, exactly like the MCP op: a rejected edit must not
+        # rotate the `.bak` while writing an unchanged body.
+        if result.get("status") == "ok":
+            save_memory(session_id, memory)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            sys.exit(1)
+
     elif args.command == "unresolved":
         result = cmd_unresolved(memory, args.text)
         save_memory(session_id, memory)
@@ -1324,6 +1695,10 @@ def main():
         if result.get("status") == "ok":
             save_memory(session_id, memory)
         print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    elif args.command == "stores":
+        print(json.dumps(cmd_stores(memory, getattr(args, "field", "")),
+                         ensure_ascii=False, indent=2))
 
     elif args.command == "dump":
         print(json.dumps(memory, ensure_ascii=False, indent=2))
