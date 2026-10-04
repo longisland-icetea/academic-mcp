@@ -12,6 +12,7 @@ JSON shapes, the same on-disk formats.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from .. import pipeline
@@ -20,6 +21,8 @@ from . import memory as memory_mod
 from . import search as search_mod
 from . import snowball as snowball_mod
 from .search import resolve_work
+
+logger = logging.getLogger("academic_mcp.agent.tools")
 
 # ── search ────────────────────────────────────────────────────────────────
 
@@ -344,13 +347,27 @@ async def citation_chain(
 # ── memory ────────────────────────────────────────────────────────────────
 
 _MEMORY_OPS = (
-    "session-key", "working-memory", "update", "edit", "list", "get", "stores",
+    "session-key", "working-memory", "telemetry", "update", "edit", "list", "get", "stores",
     "goal", "note", "finding", "unresolved", "progress", "resume", "delete-paper", "dump",
 )
 
 
 def _resolve_session(session_id: str) -> str:
-    return memory_mod.get_session_id() if not session_id else session_id
+    """The one place a caller-supplied session id becomes a path component here.
+
+    Both halves matter. A caller's id goes through `normalise_session_id` — the
+    same guard the DOI allowlist (`validate._session_id`) and the search cache
+    (`search.save_search_cache`) use. Without it, `session_id` was interpolated
+    verbatim into `DATA_DIR / f"{sid}.json"`, so the `memory` tool could read and
+    write ANY `*.json` the service can reach (`../../…/.dsh/settings` resolved
+    to a real path and was echoed back unmodified), and `cmd_telemetry` globbed
+    `f"{sid}.*.jsonl"`, so `session_id="*"` read every session's log.
+
+    An omitted id still resolves through the cwd rule, so a caller that passes
+    nothing keeps the behaviour it always had.
+    """
+    raw = session_id or memory_mod.get_session_id()
+    return memory_mod.normalise_session_id(raw, logger=logger)
 
 
 async def memory(
@@ -408,14 +425,35 @@ async def memory(
     if op == "list":
         return {"ok": True, "session_id": sid, "papers": memory_mod.cmd_list(mem)}
     if op == "get":
-        result = memory_mod.cmd_get(mem, ids or [], topic or None, include_full_text=full_text)
+        # `cmd_get` is synchronous and can shell out to the metadata fetcher
+        # (`subprocess.run(..., timeout=25)`, up to three papers) for entries
+        # with no abstract. Called directly it blocks the single event loop for
+        # up to ~37 s, stalling every other tool call in the process — including
+        # an unrelated session's search. `to_thread` keeps that off the loop.
+        result = await asyncio.to_thread(
+            memory_mod.cmd_get, mem, ids or [], topic or None, full_text
+        )
         return {"ok": True, "session_id": sid, "result": result}
     if op == "telemetry":
-        return {"ok": True, "session_id": sid, "result": memory_mod.cmd_telemetry(mem, limit=int(limit or 20))}
+        return {
+            "ok": True,
+            "session_id": sid,
+            "result": memory_mod.cmd_telemetry(mem, limit=_telemetry_limit(limit), session_id=sid),
+        }
 
     payload = data or {}
     if op == "update":
         result = memory_mod.cmd_update(mem, payload)
+        # A refused update must not read as a saved one. `cmd_update` reports its
+        # refusals as a bare `{"error": …}` body (a note with neither `paper_id`
+        # nor `doc_id`; a failed pydantic check under MEMORY_STRICT_VALIDATION),
+        # and this branch used to return `ok: True` around it anyway. The sibling
+        # ops below already promote a refusal to the outer flag; `update` is the
+        # one a client is most likely to trust, because a reader that fails here
+        # has already spent a full paper-reading model call. The document is
+        # deliberately NOT saved on this path.
+        if isinstance(result, dict) and result.get("error"):
+            return {"ok": False, "session_id": sid, "error": result}
     elif op == "edit":
         # A rejected edit must NOT persist. `cmd_edit` reports "not found" and
         # "ambiguous" as errors; saving on those would rewrite the document with
@@ -447,11 +485,31 @@ async def memory(
     return {"ok": True, "session_id": sid, "result": result}
 
 
+# Telemetry reads every file of the session it is asked about, so the entry
+# budget is clamped rather than trusted: an unbounded `limit` is a way to make
+# one tool call read a whole project's logs into the reply.
+TELEMETRY_MAX = 500
+
+
+def _telemetry_limit(limit: Any) -> int:
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        return 20
+    if value <= 0:
+        return 20
+    return min(value, TELEMETRY_MAX)
+
+
 async def telemetry(session_id: str = "", limit: int = 20) -> dict[str, Any]:
     """Read the per-session tool-call log written by clients."""
     sid = _resolve_session(session_id)
     mem = memory_mod.load_memory(sid)
-    return {"ok": True, "session_id": sid, "result": memory_mod.cmd_telemetry(mem, limit=int(limit or 20))}
+    return {
+        "ok": True,
+        "session_id": sid,
+        "result": memory_mod.cmd_telemetry(mem, limit=_telemetry_limit(limit), session_id=sid),
+    }
 
 
 def register(server: Any) -> None:

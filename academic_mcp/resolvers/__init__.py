@@ -6,7 +6,11 @@ Order matters.  Cheap-and-reliable first, expensive-and-fragile last:
     → arxiv-title-search
 
 ``direct-pdf`` covers open-access publishers whose PDF endpoint needs no
-session cookies (Nature, Springer, SciPost) — one GET instead of a browser.
+session cookies (Nature, Springer) — one GET instead of a browser. SciPost is
+deliberately NOT in that list despite a bare GET returning a PDF: it sits behind
+a proof-of-work gate, and dodging that with a non-browser User-Agent would evade
+a control someone installed on purpose. It goes through the browser instead
+(see ``publisher.py``).
 
 The last entry is a *fallback for content*, not for access: if every
 publisher path is paywalled, an arXiv preprint of the same paper is still

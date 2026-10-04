@@ -196,6 +196,27 @@ class Settings:
     # Hard ceiling for one browser session — protects the global browser lock.
     camoufox_budget: int = field(default_factory=lambda: env_int("CAMOUFOX_BUDGET", 240))
 
+    # ── Local document conversion ──────────────────────────────────────
+    # Roots a `convert_document` LOCAL path may live under. The service listens
+    # on 127.0.0.1 with no application-level auth, so before this existed any
+    # local process (or a prompt-injected agent turn) could POST an arbitrary
+    # path and have the file uploaded to MinerU's cloud — a private key renamed
+    # `.pdf`, a contract `.docx`, a spreadsheet. Colon-separated, `~` expanded.
+    # A caller that legitimately converts documents elsewhere (an agent reading a
+    # file the user uploaded) adds that directory:
+    # `ACADEMIC_DOC_ROOTS=~/data/academic:/mnt/c/Users/project`.
+    doc_roots_raw: str = field(
+        default_factory=lambda: env("ACADEMIC_DOC_ROOTS", str(Path.home() / "data" / "academic"))
+    )
+    # Hard ceiling for ONE conversion (upload + poll + download), enforced with
+    # asyncio.wait_for around the blocking MinerU call. `mineru_timeout` bounds a
+    # single poll loop; without an outer bound the ×2 retries inside and the ×2
+    # attempts above multiplied it into a ~1 hour tool call holding the per-key
+    # lock for the whole of it.
+    convert_budget: float = field(
+        default_factory=lambda: env_float("ACADEMIC_CONVERT_BUDGET", 900.0)
+    )
+
     # ── arXiv title search (DDGS) ──────────────────────────────────────
     arxiv_search_enabled: bool = field(default_factory=lambda: env_bool("ARXIV_SEARCH_ENABLED", True))
     # Enforced with asyncio.wait_for around the blocking DDGS call. DDGS runs
@@ -234,6 +255,71 @@ class Settings:
     @property
     def search_cache_dir(self) -> Path:
         return self.data_dir / "search_cache"
+
+    @property
+    def doc_roots(self) -> list[Path]:
+        """Resolved roots a local `convert_document` path may live under.
+
+        Resolved (not merely expanded) so a symlink cannot be used to point at a
+        directory outside the allow-list, and so a `/tmp` root that is itself a
+        symlink still compares equal to the path a caller passes.
+        """
+        roots: list[Path] = []
+        for raw in str(self.doc_roots_raw).split(":"):
+            text = raw.strip()
+            if not text:
+                continue
+            try:
+                roots.append(Path(text).expanduser().resolve())
+            except OSError:
+                continue
+        if not roots:
+            roots.append(self.data_dir.resolve())
+        return roots
+
+    @property
+    def dsh_attachments(self) -> Path:
+        """Where the DSH web UI stores a file the user dragged into the chat.
+
+        Overridable because `DSH_HOME` may move; the default matches the store
+        the GUI actually writes to (`<DSH_HOME>/attachments/v1/files`).
+        """
+        home = Path(os.environ.get("DSH_HOME") or (Path.home() / ".dsh"))
+        return (home / "attachments").expanduser()
+
+    def permits_doc_path(self, path: Path) -> bool:
+        """True when `path` may be uploaded to the conversion backend.
+
+        Two rules, both about paths the caller chose rather than paths a user
+        chose: the resolved path must sit under an allowed root, and no path
+        component may be a dot-directory — a `.git`, `.ssh` or `.config` object
+        is not what "convert my document" means.
+
+        The one documented exception is DSH's own attachment store
+        (`~/.dsh/attachments/…`), which is where a file the user dragged into the
+        chat actually lives. Without it the dot-rule would refuse every uploaded
+        file, which is the most legitimate case there is. The exception is a
+        prefix, not a blanket dot-allowance: `.ssh`, `.gnupg`, `.config` and
+        friends stay refused, and the FINAL component must still be a normal
+        filename.
+        """
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        if resolved.name.startswith("."):
+            return False
+        for root in self.doc_roots:
+            try:
+                relative = resolved.relative_to(root)
+            except ValueError:
+                continue
+            if any(part.startswith(".") for part in relative.parts):
+                prefix = tuple(self.dsh_attachments.parts)
+                if tuple(resolved.parts[: len(prefix)]) != prefix:
+                    return False
+            return True
+        return False
 
     def ensure_dirs(self) -> None:
         for d in (self.pdf_dir, self.md_dir):

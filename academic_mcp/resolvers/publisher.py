@@ -74,9 +74,7 @@ def _springer_pdf(doi: str) -> str:
     return f"https://link.springer.com/content/pdf/{doi}.pdf"
 
 
-def _scipost_pdf(doi: str) -> str:
-    suffix = doi.split("/", 1)[1]
-    return f"https://scipost.org/{suffix}/pdf"
+
 
 
 DIRECT_PDF: dict[str, DirectSource] = {

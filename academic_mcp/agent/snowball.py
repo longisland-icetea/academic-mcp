@@ -90,7 +90,13 @@ def _get_sem() -> asyncio.Semaphore:
 from ..config import settings as _settings  # noqa: E402  (after the module docstring block)
 
 GFW_PROXY = _settings.gfw_proxy or ""
-OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY", "")
+# Read through `settings`, NOT `os.getenv`. `.env` is parsed into
+# `config._FILE_ENV` and never exported into the process environment, so the
+# `os.getenv` spelling returned "" on every deployment that configured the key
+# the documented way: `search_papers` used the key (it reads `settings`) while
+# `citation_chain` ran anonymously against the throttled public pool, and the
+# only symptom was "fewer results".
+OPENALEX_API_KEY = _settings.openalex_api_key
 MAILTO = os.getenv("OPENALEX_MAILTO", "pi-academic-search@localhost")
 
 

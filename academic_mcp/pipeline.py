@@ -88,6 +88,36 @@ def _resolve_key(doi: str, title: str) -> str:
     return key
 
 
+async def _convert_with_budget(pdf_path: str, key: str, *, force: bool) -> str:
+    """Convert one PDF under a hard outer deadline.
+
+    The conversion is blocking (httpx + polling + zip extraction) and runs in a
+    worker thread, so `asyncio.wait_for` can only stop WAITING for it — the
+    thread finishes on its own. Stopping the wait is still the point: the tool
+    call returns a named, actionable error instead of being killed by the
+    harness after the retries multiplied the per-poll timeout, and the per-key
+    lock is released with it.
+
+    The bound exists because the inner numbers multiply: `_poll` waits
+    `mineru_timeout` (900 s) per attempt, `convert_document` retries twice, and
+    `convert_paper_pdf` retried twice more — about an hour in the worst case.
+    An explicit `mineru_timeout` can still be LARGER than this for a genuinely
+    huge document, so the budget wins and says so.
+    """
+    budget = max(60.0, settings.convert_budget)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(mineru.convert_paper_pdf, pdf_path, key, force=force),
+            timeout=budget,
+        )
+    except TimeoutError:
+        raise mineru.MineruError(
+            f"conversion exceeded the {budget:.0f}s budget (ACADEMIC_CONVERT_BUDGET). "
+            "The PDF is cached, so a later call retries only the conversion step; "
+            "for a very large document raise the budget or convert a page range first."
+        ) from None
+
+
 async def _resolve(paper: Paper, outcome: FetchOutcome) -> bytes | None:
     """Run the planned resolvers in order; return PDF bytes or None."""
     for resolver in plan(paper):
@@ -138,7 +168,7 @@ async def get_text(
         if not force and storage.is_valid_pdf(pdf):
             outcome.pdf_path = str(pdf)
             try:
-                text = await asyncio.to_thread(mineru.convert_paper_pdf, pdf, key)
+                text = await _convert_with_budget(pdf, key, force=False)
                 storage.write_md(key, text)
                 outcome.succeed(text, f"cache-pdf+{settings.mineru_model}", "convert")
                 return outcome
@@ -169,7 +199,7 @@ async def get_text(
 
         outcome.pdf_path = str(storage.write_pdf(key, data))
         try:
-            text = await asyncio.to_thread(mineru.convert_paper_pdf, outcome.pdf_path, key)
+            text = await _convert_with_budget(outcome.pdf_path, key, force=force)
         except mineru.MineruError as exc:
             # The PDF is cached, so a later call only needs the (cheap)
             # conversion step — this is a recoverable failure.

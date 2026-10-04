@@ -45,6 +45,53 @@ _extra_clients: dict[str, httpx.AsyncClient] = {}
 _client_lock = asyncio.Lock()
 
 
+class _SimpleResponse:
+    """The few response attributes `_get` needs, after a capped streamed read.
+
+    A streamed body has to be materialised before the existing decision code can
+    look at it (`resp.content[:4] == b"%PDF"`, `len(resp.content) < 5000`), so the
+    read is capped first and the result handed over as this small object rather
+    than mutating httpx's response. `truncated` records that the cap cut the body
+    short, which is how the caller tells "too large" from "small enough".
+    """
+
+    __slots__ = ("status_code", "content_type", "content", "headers", "truncated")
+
+    def __init__(
+        self,
+        status_code: int,
+        content_type: str,
+        content: bytes,
+        headers: Any = None,
+        truncated: bool = False,
+    ) -> None:
+        self.status_code = status_code
+        self.content_type = content_type
+        self.content = content
+        self.headers = headers if headers is not None else {}
+        self.truncated = truncated
+
+
+async def _read_capped(stream: Any) -> tuple[bytes, bool]:
+    """Read a streamed response up to `http_max_bytes`, then stop.
+
+    Returns `(body, truncated)`. Reading stops AT the cap instead of after it, so
+    the bound is on memory and not merely on what is accepted. The extra byte is
+    what makes truncation detectable: `cap + 1` bytes means the body reached the
+    cap, and the caller turns that into "too large" rather than handing a
+    silently truncated body to a parser.
+    """
+    cap = settings.http_max_bytes
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in stream.aiter_bytes():
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > cap:
+            return b"".join(chunks)[: cap + 1], True
+    return b"".join(chunks), False
+
+
 def _primary_proxy() -> str | None:
     """Proxy of the first route, honouring DOWNLOAD_PROXY_MODE.
 
@@ -344,7 +391,32 @@ async def _fetch_route(
     transport_failed = False
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            resp = await active.get(url, headers=headers, **kwargs)
+            # STREAMED. The size cap below used to be checked after httpx had
+            # already buffered the whole body, so an enormous response (a
+            # publisher serving a multi-GB scan, an HTML error page generated in
+            # a loop) cost its full size in RAM before being rejected — and the
+            # retry loop could pay it again on the next attempt. Reading at most
+            # `http_max_bytes` means the cap is a memory bound now, not just a
+            # verdict. Note the consequence for diagnosis: an over-cap body is
+            # truncated rather than fully read, which is why the error names the
+            # cap and not a byte count.
+            async with active.stream("GET", url, headers=headers, **kwargs) as stream:
+                status = stream.status_code
+                ctype = (stream.headers.get("content-type") or "").split(";")[0].strip()
+                # A declared size over the cap is refused BEFORE reading, so the
+                # cheapest rejection is also the earliest one.
+                declared = stream.headers.get("content-length")
+                if status == 200 and declared and declared.isdigit() and int(declared) > settings.http_max_bytes:
+                    return (
+                        FetchResult(
+                            ok=False,
+                            status=status,
+                            error=f"response too large ({declared} bytes, cap {settings.http_max_bytes})",
+                        ),
+                        False,
+                    )
+                body, truncated = await _read_capped(stream)
+                resp = _SimpleResponse(status, ctype, body, stream.headers, truncated)
         except _RETRYABLE as exc:
             transport_failed = True
             last_error = f"{type(exc).__name__}: {exc}"
@@ -358,29 +430,13 @@ async def _fetch_route(
                 isinstance(exc, httpx.TransportError),
             )
 
-        status = resp.status_code
-        ctype = (resp.headers.get("content-type") or "").split(";")[0].strip()
-
         if status == 200:
-            declared = resp.headers.get("content-length")
-            if declared and declared.isdigit() and int(declared) > settings.http_max_bytes:
+            if resp.truncated:
                 return (
                     FetchResult(
                         ok=False,
                         status=status,
-                        error=f"response too large ({declared} bytes, cap {settings.http_max_bytes})",
-                    ),
-                    False,
-                )
-            if len(resp.content) > settings.http_max_bytes:
-                return (
-                    FetchResult(
-                        ok=False,
-                        status=status,
-                        error=(
-                            f"response too large ({len(resp.content)} bytes, "
-                            f"cap {settings.http_max_bytes})"
-                        ),
+                        error=f"response exceeded the {settings.http_max_bytes} byte cap",
                     ),
                     False,
                 )

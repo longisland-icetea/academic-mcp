@@ -422,9 +422,10 @@ def model_for_source(source: str, local_path: Path | None, configured: str) -> s
 def _resolve(source: str, name: str | None) -> tuple[bool, str, str, Path | None]:
     """Return (is_url, source_id, source_hash, local_path)."""
     if source.startswith(("http://", "https://")):
-        _stem = _safe_stem(name) if name else _safe_stem(  # kept for debugging
-            source.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
-        )
+        # The output stem is derived after this point (it depends on `name` and
+        # on the disambiguation below), so nothing is computed here. The old
+        # `_stem = ...  # kept for debugging` was dead in both branches and read
+        # as if it mattered.
         return True, source, hashlib.sha256(source.encode()).hexdigest(), None
 
     path = Path(os.path.expanduser(source))
@@ -434,6 +435,21 @@ def _resolve(source: str, name: str | None) -> tuple[bool, str, str, Path | None
         raise MineruError(
             f"unsupported file type: {path.suffix} "
             f"(supported: {', '.join(sorted(SUPPORTED_SUFFIX))})"
+        )
+    # A local file is UPLOADED to MinerU's cloud, so its path is a disclosure
+    # decision rather than just a read. This checks the RESOLVED path (a symlink
+    # under an allowed root cannot point outside it), refuses dot-directories
+    # even inside a root, and names the allowed roots in the error so the caller
+    # can fix it in one step instead of guessing.
+    if not settings.permits_doc_path(path):
+        allowed = ", ".join(str(root) for root in settings.doc_roots)
+        raise MineruError(
+            f"path outside the permitted document roots: {path}\n"
+            f"allowed roots: {allowed}\n"
+            "Local documents are uploaded to the conversion backend (MinerU), so only "
+            "files under those roots may be converted. Copy the document into the library "
+            "first, or add its directory to ACADEMIC_DOC_ROOTS and restart academic-mcp. "
+            "(Dot-directories are never permitted.)"
         )
     size = path.stat().st_size
     if size > MAX_BYTES:
@@ -500,6 +516,13 @@ def convert_document(
         "model": model, "lang": lang, "pages": pages,
         "ocr": ocr, "formula": formula, "table": table,
     }
+    # `outline` and `pages_map` are deliberately NOT in the key. They are
+    # derived from the converted text, not inputs to the conversion, and putting
+    # them here created a cache entry that could never serve them: a conversion
+    # run without `pages_map` was reused for a later `pages_map=true` request,
+    # and since the flag was absent from the key the same entry was hit forever —
+    # `pages_map` came back empty on every subsequent call, permanently. Both are
+    # now rebuilt on demand from the stored markdown and asset sidecar.
     key = _cache_key(source_id, src_hash, opts)
 
     # `name` comes from the MCP caller and is interpolated straight into output
@@ -530,13 +553,34 @@ def convert_document(
         if meta.get("cache_key") == key:
             text = md_path.read_text(encoding="utf-8", errors="replace")
             meta["cached"] = True
-            logger.info("MinerU cache hit: %s", md_path)
+            # Rebuild what this REQUEST asked for but the stored conversion did
+            # not record, from the artifacts that are still on disk. Persisted
+            # afterwards so the next caller does not repeat the work — rebuilding
+            # is local and cheap, whereas the alternative was an empty result
+            # that looked like "this document has no page map".
+            assets = Path(meta["assets"]) if meta.get("assets") else None
+            rebuilt = False
+            if outline and not meta.get("outline"):
+                meta["outline"] = _build_outline(text)
+                rebuilt = True
+            if pages_map and not meta.get("pages_map"):
+                content_list = _load_content_list(assets) if assets and assets.is_dir() else None
+                meta["pages_map"] = _build_pages_map(text, content_list)
+                rebuilt = True
+            if rebuilt:
+                try:
+                    meta_path.write_text(
+                        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
+                except OSError as exc:  # a read-only cache must not break the read
+                    logger.warning("could not persist rebuilt meta for %s: %s", md_path, exc)
+            logger.info("MinerU cache hit: %s%s", md_path, " (rebuilt meta)" if rebuilt else "")
             return Conversion(
                 md_path=md_path,
                 text=text,
                 meta=meta,
-                assets=Path(meta["assets"]) if meta.get("assets") else None,
-                outline=_build_outline(text) if outline or meta.get("outline") else meta.get("outline", []),
+                assets=assets,
+                outline=meta.get("outline", []) if outline else [],
                 pages_map=meta.get("pages_map", []) if pages_map else [],
             )
 
@@ -611,9 +655,10 @@ def convert_document(
         "converted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "cached": False,
     }
-    if outline:
-        meta["outline"] = _build_outline(text)
-    if pages_map and content_list:
+    # Whatever the request asked for is stored, so a later caller wanting the
+    # same thing is a pure cache hit.
+    meta["outline"] = _build_outline(text)
+    if pages_map:
         meta["pages_map"] = _build_pages_map(text, content_list)
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -627,19 +672,30 @@ def convert_document(
     )
 
 
-def convert_paper_pdf(pdf_path: str | Path, key: str, *, attempts: int = 2) -> str:
+def convert_paper_pdf(
+    pdf_path: str | Path, key: str, *, attempts: int = 2, force: bool = False
+) -> str:
     """Convert a downloaded paper PDF to cleaned Markdown (text only).
 
     Used by the paper pipeline. The Markdown is cached under
     ``data/texts/<key>.md`` so repeated reads cost nothing.
+
+    ``force=True`` means "re-convert, do not serve me the stored Markdown". The
+    pipeline uses it after re-downloading the PDF: without it the new PDF was
+    written to disk while the caller was handed Markdown produced from the OLD
+    one — a silently inconsistent pair, after paying for the download. Note this
+    only skips the ``texts/`` cache; the document cache below is keyed by the
+    file's content hash, so a genuinely different PDF misses it anyway and an
+    identical one may legitimately hit it.
     """
     path = Path(pdf_path)
     if not path.is_file():
         raise MineruError(f"PDF not found: {path}")
 
-    cached = storage.read_md(key)
-    if cached:
-        return cached
+    if not force:
+        cached = storage.read_md(key)
+        if cached:
+            return cached
 
     if not settings.mineru_token:
         raise MineruError(
@@ -655,7 +711,7 @@ def convert_paper_pdf(pdf_path: str | Path, key: str, *, attempts: int = 2) -> s
                 out_dir=settings.md_dir,
                 name=key,
                 lang=settings.mineru_language,
-                force=True,  # md cache is checked above; never reuse a stale one
+                force=force,
             )
             text = clean_markdown(result.text)
             storage.write_md(key, text)

@@ -66,6 +66,7 @@ The JSON now has new top-level fields (all optional, schema backward compatible)
 
 import argparse
 import fcntl
+import glob
 import json
 import os
 import re
@@ -1161,11 +1162,20 @@ def cmd_resume(memory: dict[str, Any], skill: str = "") -> dict[str, Any]:
     }
 
 
-def cmd_telemetry(memory: dict[str, Any], limit: int = 20) -> dict[str, Any]:
+def cmd_telemetry(
+    memory: dict[str, Any], limit: int = 20, session_id: str | None = None
+) -> dict[str, Any]:
     """Read tool-call telemetry from data/telemetry/ if it exists.
 
     Telemetry is written by the MCP adapter; this command just surfaces it.
     Returns [] if no telemetry dir / no entries.
+
+    `session_id` is the **normalised** key and should always be passed. It used
+    to be read off `memory["session_id"]`, a key the stored document never
+    carries, so `sid` silently became `"*"` and the default read globbed every
+    session's log instead of the caller's. Passing it explicitly also keeps a
+    caller-supplied id out of the glob pattern, where `*`, `?` and `[` are
+    metacharacters rather than characters.
     """
     telemetry_dir = DATA_DIR / "telemetry"
     if not telemetry_dir.exists():
@@ -1174,8 +1184,14 @@ def cmd_telemetry(memory: dict[str, Any], limit: int = 20) -> dict[str, Any]:
     # Files: <session_id>.jsonl — one append-only file per session. The DSH
     # preset writes exactly that name; an older writer used
     # <session_id>.<timestamp>.jsonl, so both are collected for one session.
-    sid = memory.get("session_id") or "*"
-    pattern = f"{sid}.*.jsonl" if sid != "*" else "*.jsonl"
+    # `glob.escape` matters even for a normalised key: `is_session_key` allows
+    # `*` and `[` inside the body, so a key is not automatically literal here.
+    explicit = "*" if session_id is None else str(session_id)
+    sid = explicit or memory.get("session_id") or "*"
+    if sid == "*":
+        pattern = "*.jsonl"
+    else:
+        pattern = f"{glob.escape(sid)}.*.jsonl"
     files = sorted(telemetry_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
     own = telemetry_dir / f"{sid}.jsonl"
     if sid != "*" and own.is_file():

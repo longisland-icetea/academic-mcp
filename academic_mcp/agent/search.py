@@ -30,10 +30,13 @@ import argparse
 import asyncio
 import difflib
 import json
+import logging
+import math
 import os
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -50,12 +53,14 @@ except ImportError:
 
 # Configuration comes from academic_mcp.config.settings — the service's own
 # environment / .env — so this module never walks a client's directory tree.
-from ..config import settings as _settings
+from ..config import settings as _settings  # noqa: E402
 
 # Shared HTTP plumbing: the route-health memory (order_routes / mark_route_*)
 # is what makes failover fast as well as correct — a route that just failed
 # while another succeeded is tried last on the next request.
 from ..httpclient import mark_route_failed, mark_route_ok, order_routes
+
+logger = logging.getLogger("academic_mcp.agent.search")
 
 # =========================================================================
 # Configuration
@@ -1540,6 +1545,11 @@ async def lookup_doi(doi: str) -> dict | None:
 # =========================================================================
 
 # English stopwords — common words that don't carry topical meaning
+# Word tokens for the built-in reranker. Letters/digits plus intra-word `-` and
+# `'`, which is what paper titles actually contain ("MoTe2", "GW-BSE",
+# "chalcogenide's").
+_WORD_RE = re.compile(r"[a-z0-9][a-z0-9'\-]*")
+
 _STOPWORDS = frozenset({
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
@@ -1715,33 +1725,83 @@ def save_search_cache(papers: list, query: str, session_id: str = ""):
         if fcntl:
             fcntl.flock(lock_f, fcntl.LOCK_UN)
         lock_f.close()
-        # P1-CC: remove the .lock file after release to prevent orphan
-        # accumulation if the process was killed (which leaves .lock behind).
-        try:
-            os.unlink(cache_path + ".lock")
-        except OSError:
-            pass
+        # The `.lock` file is deliberately NOT unlinked. Removing it looks like
+        # tidiness and is a correctness bug: a waiter that already opened the
+        # inode blocks on a file nobody will ever unlock again, while a third
+        # writer creates a NEW file at the same path and locks that — two
+        # processes inside a critical section that is documented as exclusive.
+        # What that costs is silent: the merge below reads, unions and rewrites
+        # the DOI list, so an interleaved writer's DOIs are simply gone, and the
+        # only symptom is a later `validate_doi` refusal for a paper the session
+        # really did search for. An empty leftover file is the cheaper artefact.
+        # (`memory.save_memory` keeps its lock file for the same reason.)
 
 
 # =========================================================================
 # Hybrid relevance rerank (TF-IDF similarity + citations + recency)
 # =========================================================================
 
+def _tokenize(text: str) -> list[str]:
+    """Lowercased word and word-bigram tokens for the fallback scorer.
+
+    Bigrams matter for the same reason the sklearn path sets
+    `ngram_range=(1, 2)`: a title search is usually a phrase, and unigrams alone
+    reward a paper that merely shares the common words.
+    """
+    words = [w for w in _WORD_RE.findall(text.lower()) if len(w) > 1 and w not in _STOPWORDS]
+    return words + [f"{a} {b}" for a, b in zip(words, words[1:], strict=False)]
+
+
+def _tfidf_cosines(corpus: list, query: str) -> list:
+    """TF-IDF cosine similarity of `query` against each document.
+
+    The pure-Python path, used when scikit-learn is not installed. It replaced a
+    silent no-op: the previous code returned the input order with no
+    `hybrid_score` at all, so `rerank=True` — the default — looked like it worked
+    while the ranking was simply the engines'. This is a real implementation of
+    the same measure (sublinear tf, smoothed idf, bigrams, cosine), not an
+    approximation of one. IDF comes from the documents only; the query is
+    transformed with those IDFs and never contributes to them, which is the rule
+    the sklearn path documents.
+    """
+    doc_tokens = [_tokenize(doc) for doc in corpus]
+    query_tokens = _tokenize(query)
+    if not query_tokens:
+        return [0.0] * len(corpus)
+
+    document_frequency: Counter = Counter()
+    for tokens in doc_tokens:
+        document_frequency.update(set(tokens))
+    total = max(1, len(doc_tokens))
+
+    def weight(term: str, count: int) -> float:
+        idf = math.log((1.0 + total) / (1.0 + document_frequency[term])) + 1.0
+        return (1.0 + math.log(count)) * idf
+
+    query_vector = {term: weight(term, n) for term, n in Counter(query_tokens).items()}
+    query_norm = math.sqrt(sum(v * v for v in query_vector.values())) or 1.0
+
+    scores: list = []
+    for tokens in doc_tokens:
+        vector = {term: weight(term, n) for term, n in Counter(tokens).items()}
+        norm = math.sqrt(sum(v * v for v in vector.values())) or 1.0
+        dot = sum(query_vector.get(term, 0.0) * v for term, v in vector.items())
+        scores.append(dot / (query_norm * norm))
+    return scores
+
+
 def _hybrid_rerank(papers: list, query: str) -> list:
-    """Rerank papers by a hybrid score (dependency-light, sklearn only):
+    """Rerank papers by a hybrid score:
     score = 0.6 * TF-IDF cosine(query, title+abstract)   lexical semantics
           + 0.25 * normalized citation count             impact signal
           + 0.15 * recency (decays after 5 years)        currency signal
 
-    Papers without abstracts fall back to title-only similarity.
-    If sklearn is unavailable, returns papers in original order (no-op).
+    Papers without abstracts fall back to title-only similarity. scikit-learn is
+    used when it is importable and the built-in scorer otherwise — never a silent
+    pass-through, because a rerank that quietly does nothing is indistinguishable
+    from one that agrees with the engines.
     """
     if not papers or not query:
-        return papers
-    try:
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.metrics.pairwise import cosine_similarity
-    except ImportError:
         return papers
 
     corpus = []
@@ -1749,22 +1809,41 @@ def _hybrid_rerank(papers: list, query: str) -> list:
         text = f"{p.get('title') or ''} {p.get('abstract') or ''}".strip()
         corpus.append(text or " ")
 
+    sims: list | None = None
+    engine = "tfidf-python"
+    vectorizer = None
+    cosine_similarity = None
     try:
-        vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2),
-                              sublinear_tf=True, min_df=1)
-        # P1-C: fit ONLY on corpus; transform corpus and query separately.
-        # Previously `fit_transform(corpus + [query])` let the query
-        # participate in IDF calc, artificially lowering IDF for query
-        # terms and biasing similarity toward query-corpus overlap.
-        corpus_vec = vec.fit_transform(corpus)
-        query_vec = vec.transform([query])
-        sims = cosine_similarity(query_vec, corpus_vec).flatten()
-    except Exception:
-        return papers
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        vectorizer = TfidfVectorizer
+    except ImportError:
+        pass
+    if vectorizer is not None and cosine_similarity is not None:
+        try:
+            vec = vectorizer(stop_words="english", ngram_range=(1, 2),
+                             sublinear_tf=True, min_df=1)
+            # P1-C: fit ONLY on corpus; transform corpus and query separately.
+            # Previously `fit_transform(corpus + [query])` let the query
+            # participate in IDF calc, artificially lowering IDF for query
+            # terms and biasing similarity toward query-corpus overlap.
+            corpus_vec = vec.fit_transform(corpus)
+            query_vec = vec.transform([query])
+            sims = [float(x) for x in cosine_similarity(query_vec, corpus_vec).flatten()]
+            engine = "tfidf-sklearn"
+        except Exception as exc:  # noqa: BLE001 - a bad corpus must not fail a search
+            logger.warning("sklearn rerank failed (%s); using the built-in scorer", exc)
+    if sims is None:
+        sims = _tfidf_cosines(corpus, query)
 
     now_year = time.gmtime().tm_year
     max_cites = max((p.get("citation_count") or 0) for p in papers) or 1
 
+    # Each component travels WITH its paper. The previous version kept only
+    # `(score, paper)` and then re-read `sim`/`recency` from the loop variable in
+    # the reporting loop, so every paper reported the LAST paper's similarity and
+    # recency — a number the model is invited to reason about, silently wrong for
+    # all but one row.
     scored = []
     for p, sim in zip(papers, sims, strict=False):
         cites = p.get("citation_count") or 0
@@ -1772,15 +1851,16 @@ def _hybrid_rerank(papers: list, query: str) -> list:
         age = max(0, now_year - year)
         recency = 1.0 if age <= 5 else max(0.0, 1.0 - (age - 5) / 20.0)
         score = 0.6 * float(sim) + 0.25 * (cites / max_cites) + 0.15 * recency
-        scored.append((score, p))
+        scored.append((score, p, float(sim), recency))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     # P0-8 修复：保留 hybrid_score 与各 score_components，让 SKILL.md 承诺的 "1-5 分数" 可被追溯
     out = []
-    for score, p in scored:
+    for score, p, sim, recency in scored:
         p["hybrid_score"] = round(float(score), 4)
+        p["rerank_engine"] = engine
         p["score_components"] = {
-            "tfidf_similarity": round(float(sim), 4),
+            "tfidf_similarity": round(sim, 4),
             "citation_norm": round(float((p.get("citation_count") or 0) / max_cites), 4) if max_cites else 0,
             "recency": round(float(recency), 4) if (p.get("year") or 0) else 0,
         }
