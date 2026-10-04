@@ -135,9 +135,94 @@ async def test_memory_tool_rejects_unknown_op():
     assert "unknown op" in payload["error"]
 
 
+async def test_memory_tool_normalises_a_caller_supplied_session_id(tmp_path, monkeypatch):
+    """A `session_id` is a path component, so it must go through the one guard.
+
+    The regression: `_resolve_session` returned the caller's string verbatim, so
+    `memory` and `telemetry` were the only two entry points that skipped
+    `normalise_session_id`. A traversal id then resolved to a real file path
+    (`DATA_DIR / "../../…" / f"{sid}.json"`) instead of falling back to
+    `default`, which made every `*.json` the service can reach readable — and,
+    through `save_memory`'s tmp + `.bak` + rename, writable.
+    """
+    monkeypatch.setattr(memory_mod, "DATA_DIR", tmp_path)
+
+    payload = await agent_tools.memory("dump", session_id="../../../tmp/evil")
+    assert payload["session_id"] == "default", payload
+
+    # The write path is the dangerous one: prove nothing landed outside the root.
+    written = await agent_tools.memory("goal", data={"goal": "x"}, session_id="../../escaped")
+    assert written["session_id"] == "default"
+    assert not (tmp_path.parent / "escaped.json").exists()
+
+    # A real key still round-trips unchanged, CJK included.
+    key = memory_mod.session_key_for_cwd("/mnt/c/Users/Sync/郑州大学/8.重点研发")
+    ok = await agent_tools.memory("dump", session_id=key)
+    assert ok["session_id"] == key
+
+
+async def test_telemetry_reads_only_the_session_it_was_asked_for(tmp_path, monkeypatch):
+    """Telemetry is per session, and the id is not a glob pattern.
+
+    The regression: `cmd_telemetry` read the id off `memory["session_id"]`, a key
+    the stored document never carries, so it silently fell back to `"*"` and the
+    default read globbed every session's log. `is_session_key` allows `*` inside
+    a key body, so the id also reached `Path.glob` as a pattern.
+    """
+    monkeypatch.setattr(memory_mod, "DATA_DIR", tmp_path)
+    telemetry_dir = tmp_path / "telemetry"
+    telemetry_dir.mkdir(parents=True)
+    (telemetry_dir / "--home-mine--.jsonl").write_text(
+        json.dumps({"tool": "mine"}) + "\n", encoding="utf-8"
+    )
+    (telemetry_dir / "--home-theirs--.jsonl").write_text(
+        json.dumps({"tool": "theirs"}) + "\n", encoding="utf-8"
+    )
+
+    payload = await agent_tools.telemetry(session_id="--home-mine--")
+    tools = [e["tool"] for e in payload["result"]["entries"]]
+    assert tools == ["mine"], payload["result"]
+
+    # An accidentally wildcard-shaped key must stay a literal, not a pattern.
+    star = await agent_tools.memory("telemetry", session_id="--a*b--")
+    assert star["result"]["entries"] == []
+
+
+async def test_memory_update_refusal_is_not_reported_as_a_saved_note(tmp_path, monkeypatch):
+    """A refused write must fail loudly, because the caller has already paid.
+
+    The regression: `cmd_update` reports "missing paper_id/doc_id" as a bare
+    `{"error": …}`, and the `update` branch wrapped it in `{"ok": True,
+    "result": …}` — the only op that did. A client checking `ok` (the natural
+    reading, and what `edit`/`delete-paper`/`stores` teach it to do) then printed
+    "notes auto-saved" over notes that were never written, and the document was
+    not saved at all.
+    """
+    monkeypatch.setattr(memory_mod, "DATA_DIR", tmp_path)
+
+    refused = await agent_tools.memory(
+        "update",
+        session_id="--home-alice--",
+        data={"paper_notes": [{"title": "no identity at all"}]},
+    )
+    assert refused["ok"] is False, refused
+    assert refused["error"]["error"] == "missing paper_id/doc_id"
+    # Nothing was persisted, so the failure cannot resurface as a half-written doc.
+    assert memory_mod.load_memory("--home-alice--")["paper_library"] == []
+
+    # The success path is untouched.
+    saved = await agent_tools.memory(
+        "update",
+        session_id="--home-alice--",
+        data={"paper_notes": [{"paper_id": "10.1_x", "doi": "10.1/x", "title": "t"}]},
+    )
+    assert saved["ok"] is True, saved
+    assert saved["result"]["status"] == "ok"
+    assert len(memory_mod.load_memory("--home-alice--")["paper_library"]) == 1
+
+
 async def test_citation_chain_accepts_session_id():
     """`session_id` must reach the tool that writes the DOI allowlist.
-
     It was accepted by `citation_chain()` but dropped by the registered wrapper,
     so every citation-chain result was filed under `default` and then refused by
     `validate_doi` for the session that discovered it.
@@ -786,6 +871,221 @@ def test_download_routes_follow_the_mode(monkeypatch):
     assert hc._routes() == [_FAILOVER_HOP], "no duplicate route"
 
 
+# ── the browser's exit is a per-request decision, not a deployment setting ──
+#
+# `_browser_config` used to read the proxy off settings at session start, so
+# EVERY browser request left through DOWNLOAD_PROXY whenever it was configured.
+# Measured 2026-10-04 on one and the same PDF:
+#
+#     direct (Shanghai, CERNET)       -> 200, 808853 bytes, a real PDF
+#     DOWNLOAD_PROXY (Hong Kong, HKU) -> 401, "Authorization Required"
+#
+# APS entitlements are per-IP, so a fixed exit turns a working download into an
+# authorization wall. The browser now walks the same routes as `httpclient`,
+# which is what lets the second one rescue the first.
+
+
+def test_browser_routes_mirror_the_download_routes(monkeypatch):
+    """Direct first, the proxy as the rescue hop — the httpclient order."""
+    from academic_mcp.resolvers import camoufox as cf
+
+    monkeypatch.setattr(cf.settings, "download_proxy", _FAILOVER_HOP)
+    monkeypatch.setattr(cf.settings, "download_proxy_mode", "failover")
+    assert cf._browser_routes() == [None, _FAILOVER_HOP]
+    monkeypatch.setattr(cf.settings, "download_proxy_mode", "fallback")
+    assert cf._browser_routes() == [None, _FAILOVER_HOP]
+
+    # `primary` keeps the old behaviour available for a publisher that is only
+    # reachable from the proxy.
+    monkeypatch.setattr(cf.settings, "download_proxy_mode", "primary")
+    assert cf._browser_routes() == [_FAILOVER_HOP]
+
+    monkeypatch.setattr(cf.settings, "download_proxy_mode", "none")
+    assert cf._browser_routes() == [None], "none ignores the configured proxy"
+
+    # No proxy configured at all: one route, and it is direct.
+    monkeypatch.setattr(cf.settings, "download_proxy", None)
+    monkeypatch.setattr(cf.settings, "download_proxy_mode", "failover")
+    assert cf._browser_routes() == [None]
+
+
+def test_the_browser_config_takes_its_exit_from_the_caller(monkeypatch):
+    """A session's exit must be settable per session, or the retry is impossible.
+
+    The regression this pins: `_browser_config(headless)` read
+    `settings.download_proxy` itself, so a second session could not be sent out
+    of a different exit — the authorization wall was terminal.
+    """
+    from academic_mcp.resolvers import camoufox as cf
+
+    monkeypatch.setattr(cf.settings, "download_proxy", _FAILOVER_HOP)
+
+    direct = cf._browser_config(True, None)
+    assert direct["proxy"] is None, "route None must mean direct, not 'read settings'"
+
+    proxied = cf._browser_config(True, _FAILOVER_HOP)
+    assert proxied["proxy"] == {"server": _FAILOVER_HOP}
+
+
+# ── the arXiv fallback must not depend on a search engine ────────────────────
+#
+# The resolver whose whole job is to rescue a paper the publisher would not give
+# us was asking Google, Brave and DuckDuckGo to find the preprint. Measured
+# 2026-10-04 all three were refusing us (Brave 429, Google 403, DuckDuckGo an
+# empty 202), so 23 of 27 title searches failed and paywalled APS papers went
+# undownloaded *while their preprints sat on arXiv*. The API needed no search
+# engine and answered both papers that had just failed, in under a second.
+
+_ATOM_SAMPLE = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>arXiv Query</title>
+  <entry>
+    <id>http://arxiv.org/abs/2311.04560v2</id>
+    <title>Fast Generation of GHZ-like States Using Collective-Spin XYZ Model</title>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2311.04560v1</id>
+    <title>the same paper, first version</title>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2409.08524v1</id>
+    <title>A different paper</title>
+  </entry>
+</feed>
+"""
+
+
+def _arxiv_api(monkeypatch, body=_ATOM_SAMPLE, status=200, recorder=None):
+    """Stub `httpx.get`, which is how `_api_ids` reaches the network."""
+    import httpx
+
+    class FakeResponse:
+        status_code = status
+        text = body
+
+    def fake_get(url, **kwargs):
+        if recorder is not None:
+            recorder.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+
+def test_arxiv_api_search_returns_ids_and_drops_versions(monkeypatch):
+    from academic_mcp.resolvers.arxiv import ArxivTitleResolver
+
+    _arxiv_api(monkeypatch)
+    ids = ArxivTitleResolver()._api_ids("Fast Generation of GHZ-like States")
+    # v2 and v1 are the same preprint: one candidate, and the version suffix is
+    # stripped because `arxiv.org/pdf/<id>` is asked for bare.
+    assert ids == ["2311.04560", "2409.08524"], ids
+
+
+def test_arxiv_api_search_asks_for_the_title_field(monkeypatch):
+    """A quoted `ti:` phrase, not `all:`.
+
+    An unquoted query is an OR over every word and answers with a page of
+    unrelated papers; a quoted `all:` over a full title usually answers with
+    nothing at all. The verification step downstream decides which candidate is
+    right, so this only has to be a good query — but it has to be a good one.
+    """
+    from academic_mcp.resolvers.arxiv import ArxivTitleResolver
+
+    seen: list[tuple] = []
+    _arxiv_api(monkeypatch, recorder=seen)
+    ArxivTitleResolver()._api_ids('A Title: with "quotes" & symbols')
+
+    url, kwargs = seen[0]
+    assert "search_query=ti:" in url, url
+    assert "max_results=" in url
+    # The title's own quotes and backslashes must not break the phrase we build.
+    assert url.count("%22") == 2, url
+    assert '"' not in url.split("search_query=")[1].split("&")[0]
+    assert kwargs.get("follow_redirects") is True
+
+
+def test_arxiv_api_failure_is_not_an_exception(monkeypatch):
+    """Discovery must never raise: it is the last resolver in the chain."""
+    import httpx
+
+    from academic_mcp.resolvers.arxiv import ArxivTitleResolver
+
+    def boom(url, **kwargs):
+        raise httpx.ConnectTimeout("blackholed")
+
+    monkeypatch.setattr(httpx, "get", boom)
+    assert ArxivTitleResolver()._api_ids("Anything") == []
+
+    _arxiv_api(monkeypatch, body="<html>not xml", status=200)
+    assert ArxivTitleResolver()._api_ids("Anything") == []
+
+    _arxiv_api(monkeypatch, status=503)
+    assert ArxivTitleResolver()._api_ids("Anything") == []
+
+
+def test_arxiv_search_prefers_the_api_and_keeps_ddgs_as_the_rescue(monkeypatch):
+    """The API answers first; DDGS is only reached when it has nothing.
+
+    Pinned as an ORDER because the reverse silently restores the failure: a
+    dead search engine would then be consulted before the source that works.
+    """
+    from academic_mcp.resolvers.arxiv import ArxivTitleResolver
+    from academic_mcp.resolvers.base import Paper
+
+    resolver = ArxivTitleResolver()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        resolver, "_api_ids",
+        lambda title: (calls.append("api"), ["2311.04560"])[1],
+    )
+    monkeypatch.setattr(
+        resolver, "_ddgs_ids",
+        lambda title: (calls.append("ddgs"), ["9999.99999"])[1],
+    )
+
+    paper = Paper(doi="10.1103/x", title="Fast Generation of GHZ-like States")
+    assert resolver._search_sync(paper) == ["2311.04560"]
+    assert calls == ["api"], "a hit from the API must not also pay for DDGS"
+
+    # API empty -> the web fallback is still tried.
+    calls.clear()
+    monkeypatch.setattr(resolver, "_api_ids", lambda title: (calls.append("api"), [])[1])
+    assert resolver._search_sync(paper) == ["9999.99999"]
+    assert calls == ["api", "ddgs"]
+
+
+async def test_arxiv_api_hit_is_verified_before_it_is_downloaded(monkeypatch):
+    """A candidate from the API is still only a candidate.
+
+    The API's phrase match can land on a different paper sharing a prefix, and
+    fetching the wrong paper is worse than failing: the reading pass writes
+    confident notes about it. `_find` must route the ids through `_verify`.
+    """
+    from academic_mcp.resolvers.arxiv import ArxivTitleResolver
+    from academic_mcp.resolvers.base import Paper
+
+    resolver = ArxivTitleResolver()
+    monkeypatch.setattr(resolver, "_search_sync", lambda paper: ["2311.04560"])
+    verified: list[list[str]] = []
+
+    async def fake_verify(ids, paper, client):
+        verified.append(ids)
+        return None
+
+    async def fake_client(**overrides):
+        return object()
+
+    monkeypatch.setattr(resolver, "_verify", fake_verify)
+    monkeypatch.setattr(
+        "academic_mcp.resolvers.arxiv.httpclient.get_client", fake_client
+    )
+
+    paper = Paper(doi="10.1103/x", title="Some Title")
+    assert await resolver._find(paper) is None
+    assert verified == [["2311.04560"]], "the API's candidates must be verified"
+
+
 def test_search_route_chain_gains_the_failover_hop(monkeypatch):
     from academic_mcp.agent import search as s
 
@@ -1002,3 +1302,268 @@ async def test_a_doi_record_without_a_doi_does_not_duplicate_the_work(monkeypatc
     assert len(out) == 1, [p.get("doi") for p in out]
     # The DOI-bearing record wins the slot: it is the one that can be downloaded.
     assert out[0]["doi"] == "10.1038/s41586-021-03853-0"
+
+
+# ── local document conversion: allow-list, force, rerank, locking ──────────
+#
+# Each of these covers a defect that was silent: a path check that did not exist
+# (any local file could be uploaded to MinerU), a `force` that re-downloaded and
+# then served stale Markdown, a rerank that quietly did nothing when sklearn was
+# absent, per-paper score components read from the wrong row, and a cache lock
+# whose file was deleted on release.
+
+
+def test_doc_roots_allow_list(tmp_path, monkeypatch):
+    """Only files under a configured root may be uploaded for conversion.
+
+    The regression: `convert_document` accepted ANY readable path, and a local
+    file is uploaded to MinerU's cloud, so `~/.ssh/x.pdf` or a contract `.docx`
+    left the machine on request. `ACADEMIC_DOC_ROOTS` is the boundary.
+    """
+    from academic_mcp.config import Settings
+
+    root = tmp_path / "library"
+    root.mkdir()
+    inside = root / "paper.pdf"
+    inside.write_bytes(b"%PDF-1.4\n")
+    nested = root / "sub" / "deep.docx"
+    nested.parent.mkdir()
+    nested.write_bytes(b"x")
+
+    outside = tmp_path / "secret.pdf"
+    outside.write_bytes(b"%PDF-1.4\n")
+
+    hidden = root / ".ssh" / "key.pdf"
+    hidden.parent.mkdir()
+    hidden.write_bytes(b"%PDF-1.4\n")
+
+    cfg = Settings(doc_roots_raw=str(root))
+    assert cfg.permits_doc_path(inside) is True
+    assert cfg.permits_doc_path(nested) is True
+    assert cfg.permits_doc_path(outside) is False, "a path outside every root must be refused"
+    assert cfg.permits_doc_path(hidden) is False, "dot-directories are never permitted"
+
+    # The error the caller sees must name the roots, so the fix is one step.
+    from academic_mcp import mineru
+
+    monkeypatch.setattr(mineru.settings, "doc_roots_raw", str(root))
+    with pytest.raises(mineru.MineruError) as excinfo:
+        mineru._resolve(str(outside), None)
+    assert "permitted document roots" in str(excinfo.value)
+    assert str(root) in str(excinfo.value)
+    # And a permitted path still resolves.
+    is_url, source_id, _hash, path = mineru._resolve(str(inside), None)
+    assert (is_url, path) == (False, inside)
+
+
+def test_permits_doc_path_resolves_symlinks(tmp_path, monkeypatch):
+    """A symlink inside an allowed root must not reach outside it."""
+    from academic_mcp.config import Settings
+
+    root = tmp_path / "library"
+    root.mkdir()
+    target = tmp_path / "outside.pdf"
+    target.write_bytes(b"%PDF-1.4\n")
+    link = root / "link.pdf"
+    try:
+        link.symlink_to(target)
+    except OSError:  # pragma: no cover - filesystem without symlink support
+        pytest.skip("symlinks unavailable")
+
+    cfg = Settings(doc_roots_raw=str(root))
+    assert cfg.permits_doc_path(link) is False
+
+
+def _seed_cache(cache, doc, name: str, body: str) -> None:
+    """Write a plausible cache entry for `doc` using the service's own key rule.
+
+    Built through `mineru`'s own helpers rather than by hand: a hand-written key
+    that happens to disagree is a test that passes for the wrong reason.
+    """
+    from academic_mcp import mineru
+
+    is_url, source_id, src_hash, local = mineru._resolve(str(doc), None)
+    assert is_url is False
+    model = mineru.model_for_source(str(doc), local, mineru.settings.mineru_model)
+    key = mineru._cache_key(source_id, src_hash, {
+        "model": model, "lang": mineru.settings.mineru_language,
+        "pages": None, "ocr": None, "formula": True, "table": True,
+    })
+    (cache / f"{name}.md").write_text(body, encoding="utf-8")
+    (cache / f"{name}.meta.json").write_text(
+        json.dumps({"cache_key": key, "assets": str(cache / f"{name}_assets"), "outline": []}),
+        encoding="utf-8",
+    )
+
+
+def test_convert_document_force_skips_both_caches(tmp_path, monkeypatch):
+    """`force=True` must re-convert, and must not be defeated by a cached file.
+
+    The regression was on the paper path: the pipeline re-downloaded the PDF and
+    then asked `convert_paper_pdf`, whose first act was `read_md(key)` — so a
+    "force" re-fetch returned Markdown produced from the PREVIOUS PDF, at full
+    download cost. This pins the document-level half: with `force`, the stored
+    `.md` is not what comes back.
+    """
+    from academic_mcp import mineru
+
+    monkeypatch.setattr(mineru.settings, "doc_roots_raw", str(tmp_path))
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    doc = tmp_path / "doc.pdf"
+    doc.write_bytes(b"%PDF-1.4\n")
+
+    calls = {"n": 0}
+
+    def fake_extract(_blob, out_dir, stem):
+        calls["n"] += 1
+        assets = out_dir / f"{stem}_assets"
+        assets.mkdir(parents=True, exist_ok=True)
+        md = out_dir / f"{stem}.md"
+        text = f"# fresh body {calls['n']}\n"
+        md.write_text(text, encoding="utf-8")
+        return md, assets
+
+    monkeypatch.setattr(mineru, "_read_capped", lambda *a, **k: (b"zip", False), raising=False)
+    monkeypatch.setattr(mineru, "_download", lambda url: b"zip")
+    monkeypatch.setattr(mineru, "_extract_zip", fake_extract)
+    monkeypatch.setattr(mineru, "_create_task", lambda *a, **k: ("batch", ["http://upload"]))
+    monkeypatch.setattr(mineru, "_put_file", lambda *a, **k: None)
+    monkeypatch.setattr(mineru, "_poll", lambda *a, **k: {"state": "done", "full_zip_url": "http://zip"})
+    monkeypatch.setattr(mineru.settings, "mineru_token", "test-token")
+
+    _seed_cache(cache, doc, "doc", "# stale body\n")
+
+    hit = mineru.convert_document(str(doc), out_dir=cache, name="doc")
+    assert "stale body" in hit.text, "without force the cache is served"
+    assert calls["n"] == 0, "a cache hit must not convert"
+
+    forced = mineru.convert_document(str(doc), out_dir=cache, name="doc", force=True)
+    assert "stale body" not in forced.text, "force must not be defeated by the document cache"
+    assert "fresh body" in forced.text
+    assert calls["n"] == 1
+
+
+def test_pages_map_is_rebuilt_on_a_cache_hit(tmp_path, monkeypatch):
+    """A cached conversion must still be able to answer `pages_map=true`.
+
+    The regression: `pages_map` was absent from the cache key AND only stored
+    when it had been requested, so the first caller who asked for it on an
+    already-cached document got `[]` — and because the key matched, they got `[]`
+    forever. Rebuilding from the stored sidecar is the fix; this pins it.
+    """
+    from academic_mcp import mineru
+
+    monkeypatch.setattr(mineru.settings, "doc_roots_raw", str(tmp_path))
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    assets = cache / "doc_assets"
+    assets.mkdir()
+    (assets / "doc_content_list.json").write_text(
+        json.dumps([
+            {"type": "text", "page_idx": 0, "text": "first page words"},
+            {"type": "text", "page_idx": 1, "text": "second page words"},
+        ]),
+        encoding="utf-8",
+    )
+    doc = tmp_path / "doc.pdf"
+    doc.write_bytes(b"%PDF-1.4\n")
+    md = cache / "doc.md"
+    md.write_text("first page words\n\nsecond page words\n", encoding="utf-8")
+    (cache / "doc.meta.json").write_text(
+        json.dumps({
+            "cache_key": mineru._cache_key(str(doc), mineru._sha256_file(doc), {
+                "model": mineru.settings.mineru_model, "lang": mineru.settings.mineru_language,
+                "pages": None, "ocr": None, "formula": True, "table": True,
+            }),
+            "assets": str(assets),
+            "outline": [],
+        }),
+        encoding="utf-8",
+    )
+
+    out = mineru.convert_document(str(doc), out_dir=cache, name="doc", pages_map=True)
+    assert out.meta.get("cached") is True, "this must be a cache hit"
+    assert out.pages_map, "pages_map must be rebuilt, not silently empty"
+    # And it is persisted, so the next caller does not repeat the rebuild.
+    stored = json.loads((cache / "doc.meta.json").read_text(encoding="utf-8"))
+    assert stored.get("pages_map")
+
+
+def test_hybrid_rerank_scores_each_paper_on_its_own_components():
+    """`score_components` must belong to the row it is printed on.
+
+    The regression: the reporting loop re-read `sim` and `recency` from the
+    scoring loop's variable, so every paper reported the LAST paper's values —
+    a number the model is explicitly invited to reason about.
+    """
+    from academic_mcp.agent import search as s
+
+    papers = [
+        {"title": "Exciton exchange coupling in MoTe2 monolayers",
+         "abstract": "exchange coupling of excitons", "citation_count": 50, "year": 2021},
+        {"title": "Unrelated photocatalysis study",
+         "abstract": "water splitting on TiO2", "citation_count": 500, "year": 2019},
+    ]
+    out = s._hybrid_rerank(papers, "exciton exchange coupling MoTe2")
+    assert out[0]["title"].startswith("Exciton"), [p["title"] for p in out]
+    top, bottom = out[0]["score_components"], out[1]["score_components"]
+    assert top["tfidf_similarity"] > bottom["tfidf_similarity"], (top, bottom)
+    assert bottom["tfidf_similarity"] == 0.0, bottom
+    # The engine is named, so "which scorer produced this order" is answerable.
+    assert out[0]["rerank_engine"] in ("tfidf-sklearn", "tfidf-python")
+    assert all(p["score_components"]["citation_norm"] > 0 for p in out)
+
+
+def test_rerank_never_silently_returns_the_input_order(monkeypatch):
+    """Without sklearn the rerank must still reorder by the hybrid score.
+
+    The regression: `except ImportError: return papers` — `rerank=True` is the
+    default, so on this deployment (sklearn is not installed and was never a
+    declared dependency) the "hybrid rerank" the README advertises was a no-op,
+    with no `hybrid_score` on any row to notice it by.
+    """
+    import builtins
+
+    from academic_mcp.agent import search as s
+
+    real_import = builtins.__import__
+
+    def no_sklearn(name, *args, **kwargs):
+        if name.startswith("sklearn"):
+            raise ImportError("sklearn disabled for this test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_sklearn)
+    papers = [
+        {"title": "Unrelated photocatalysis study", "abstract": "water splitting", "citation_count": 1, "year": 2024},
+        {"title": "Exciton exchange coupling in MoTe2", "abstract": "exchange coupling", "citation_count": 1, "year": 2024},
+    ]
+    out = s._hybrid_rerank(papers, "exciton exchange coupling")
+    assert [p["title"] for p in out][0].startswith("Exciton"), "the fallback must actually rank"
+    assert out[0]["rerank_engine"] == "tfidf-python"
+    assert all("hybrid_score" in p for p in out)
+
+
+def test_search_cache_lock_file_survives_release(tmp_path, monkeypatch):
+    """The `.lock` file must NOT be unlinked on release.
+
+    Unlinking it re-opens the race the lock exists to close: a waiter blocked on
+    the old inode and a new writer creating a fresh file both believe they hold
+    it, and the merge below loses whichever writer finishes second — visible only
+    later, as `validate_doi` refusing a DOI the session really did search for.
+    """
+    from academic_mcp.agent import search as s
+
+    cache_dir = tmp_path / "search_cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(s, "CACHE_DIR", str(cache_dir))
+
+    s.save_search_cache([{"doi": "10.1/x", "title": "t"}], "a query", "--home-alice--")
+    lock = cache_dir / "--home-alice--.json.lock"
+    assert lock.exists(), "the lock file is left in place on purpose"
+
+    # A second writer must merge, not clobber.
+    s.save_search_cache([{"doi": "10.2/y", "title": "u"}], "another query", "--home-alice--")
+    data = json.loads((cache_dir / "--home-alice--.json").read_text(encoding="utf-8"))
+    assert {"10.1/x", "10.2/y"} <= {d.lower() for d in data["dois"]}, data["dois"]

@@ -48,7 +48,7 @@ The essentials:
 | `ELSEVIER_API_KEY` | Scopus search + ScienceDirect download | — |
 | `OPENALEX_API_KEY` | OpenAlex search + citation chains | — |
 | `DOWNLOAD_PROXY` | publisher/API access, and the rescue route in `failover` mode; empty = direct only | — |
-| `DOWNLOAD_PROXY_MODE` | `primary` / `fallback` / `failover` / `none` | `fallback` |
+| `DOWNLOAD_PROXY_MODE` | `primary` / `fallback` / `failover` / `none` — governs the **browser** resolver as well as the HTTP client | `fallback` |
 | `GFW_PROXY` | primary route for OpenAlex search / arXiv (failover hop applies here too) | — |
 | `ACADEMIC_MCP_HOST` / `ACADEMIC_MCP_PORT` | listen address | `127.0.0.1` / `8790` |
 | `ACADEMIC_DOC_CACHE` | local conversion cache | `~/.cache/academic-mcp/doc-read` |
@@ -103,14 +103,21 @@ Cheap and reliable first, expensive and fragile last:
    deliberately excluded: it sits behind a proof-of-work gate, and dodging that
    with a non-browser User-Agent would evade a control someone installed on
    purpose — it goes through the browser instead.
-4. `camoufox-browser` — headful Firefox, CloudFlare bypass, paywalls
-5. `arxiv-title-search` — find the preprint by title (DDGS + verification)
+4. `camoufox-browser` — headful Firefox, CloudFlare bypass, paywalls. Walks the
+   same routes as the HTTP client (`DOWNLOAD_PROXY_MODE`), one browser session
+   per exit, because entitlements are per-IP: an exit that is a subscriber for
+   one publisher is a stranger for the next, and the second route is what
+   rescues the first.
+5. `arxiv-title-search` — find the preprint by title (arXiv API + verification,
+   with DDGS as a rescue for titles the API's phrase match cannot reach)
 
 The last one is a fallback for *content*, not access: when every publisher path
 is paywalled, an arXiv preprint of the same paper is still worth reading. It
 runs last so the version-of-record wins when reachable. Candidates are verified
 (title similarity + author) before use — fetching the wrong paper is worse than
-failing.
+failing. It asks arXiv's own API first and keeps web search as the rescue,
+because a resolver whose job is to work when the publisher refused us cannot
+depend on search engines that may be refusing us too.
 
 ## Display for the browser
 

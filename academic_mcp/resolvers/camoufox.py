@@ -20,6 +20,7 @@ survive any rewrite:
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import os
 import random
@@ -323,7 +324,38 @@ def _clear_proxy_env() -> None:
         os.environ.pop(var, None)
 
 
-def _browser_config(headless: bool) -> dict:
+def _browser_routes() -> list[str | None]:
+    """The exits to try for browser traffic, in order.
+
+    Deliberately the same vocabulary as ``httpclient._routes()``: the proxy is
+    not a property of the deployment but of *who the publisher thinks we are*,
+    and the two exits are not interchangeable. Measured 2026-10-04, requesting
+    the very same PDF:
+
+        direct (Shanghai, CERNET)       -> 200, 808853 bytes, a real PDF
+        DOWNLOAD_PROXY (Hong Kong, HKU) -> 401, "Authorization Required"
+
+    APS entitlements are per-IP, so the Hong Kong exit is a subscriber for some
+    publishers and a stranger for others. Routing every browser request through
+    it — which is what happened before this existed — turned a working download
+    into an authorization wall and made the whole APS backlog look unfetchable.
+
+    Ordering is the caller's ``DOWNLOAD_PROXY_MODE``:
+
+        * ``primary``  — the proxy, and only the proxy;
+        * ``failover`` / ``fallback`` — direct first, then the proxy;
+        * ``none``     — direct, ignoring the proxy entirely.
+    """
+    proxy = settings.download_proxy
+    mode = settings.download_proxy_mode
+    if not proxy or mode == "none":
+        return [None]
+    if mode == "primary":
+        return [proxy]
+    return [None, proxy]
+
+
+def _browser_config(headless: bool, proxy: str | None = None) -> dict:
     from camoufox import DefaultAddons  # heavy import; keep it out of module load
 
     config: dict = {
@@ -347,11 +379,11 @@ def _browser_config(headless: bool) -> dict:
             "dom.webnotifications.enabled": False,
         },
     }
-    proxy = settings.download_proxy
-    if proxy and settings.download_proxy_mode != "none":
-        config["proxy"] = {"server": proxy}
-    else:
-        config["proxy"] = None
+    # The exit is chosen by the caller (one route per browser session), not read
+    # off settings here: a session that comes back with an authorization wall has
+    # to be re-run on a different exit, and that is only possible if the exit is
+    # a parameter.
+    config["proxy"] = {"server": proxy} if proxy else None
     return config
 
 
@@ -1383,9 +1415,10 @@ class CamoufoxResolver:
         return settings.camoufox_enabled and bool(paper.doi)
 
     async def fetch(self, paper: Paper) -> bytes | None:
-        try:
-            from camoufox import AsyncCamoufox
-        except ImportError:
+        # Availability, not an import: camoufox pulls in playwright, which is
+        # heavy, and the failure this guards against is a missing extra — a
+        # `find_spec` answers that without paying for the import.
+        if importlib.util.find_spec("camoufox") is None:
             logger.warning("camoufox not installed — browser resolver disabled")
             return None
 
@@ -1400,10 +1433,47 @@ class CamoufoxResolver:
         article_url, pdf_url = build_urls(paper.doi, publisher)
         logger.info("publisher=%s article=%s", publisher, article_url[:90])
 
+        routes = _browser_routes()
+        for index, route in enumerate(routes):
+            data = await self._fetch_via_route(
+                paper, publisher, article_url, pdf_url, headless, route
+            )
+            if data:
+                return data
+            # Another exit is a different subscriber. A publisher that answered
+            # "Authorization Required" on one IP answers with the paper on
+            # another, which is exactly the APS case this loop exists for.
+            if index + 1 < len(routes):
+                logger.info(
+                    "route %s gave no PDF for %s — retrying via %s",
+                    route or "direct",
+                    paper.label,
+                    routes[index + 1] or "direct",
+                )
+        return None
+
+    async def _fetch_via_route(
+        self,
+        paper: Paper,
+        publisher: str | None,
+        article_url: str,
+        pdf_url: str,
+        headless: bool,
+        proxy: str | None,
+    ) -> bytes | None:
+        """One browser session, on one exit."""
+        from camoufox import AsyncCamoufox
+
         async with _browser_lock:
-            logger.info("browser lock acquired (headless=%s)", headless)
+            logger.info(
+                "browser lock acquired (headless=%s, route=%s)",
+                headless,
+                proxy or "direct",
+            )
             try:
-                async with AsyncCamoufox(**_browser_config(headless)) as browser:
+                async with AsyncCamoufox(
+                    **_browser_config(headless, proxy)
+                ) as browser:
                     page = await browser.new_page()
                     page.on("crash", lambda: None)
                     page._pdf_responses = []

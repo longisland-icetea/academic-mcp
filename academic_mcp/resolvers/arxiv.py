@@ -13,6 +13,7 @@ import asyncio
 import difflib
 import logging
 import re
+import xml.etree.ElementTree as ET
 
 from .. import httpclient
 from ..config import settings
@@ -23,6 +24,11 @@ logger = logging.getLogger("academic_mcp.resolvers.arxiv")
 _NEW_ID = re.compile(r"^(\d{4}\.\d{4,5})(?:v\d+)?$")
 _OLD_ID = re.compile(r"^([a-z-]+(?:\.[A-Z]{2})?/\d{7})(?:v\d+)?$")
 _ARXIV_ANY = re.compile(r"arxiv\.org/(?:abs|pdf|html)/(\d{4}\.\d{4,5})")
+
+# The arXiv API's own title search. Quoted, because an unquoted query is an
+# OR over every word and returns a page of unrelated papers for any title.
+_ARXIV_API = "https://export.arxiv.org/api/query"
+_ATOM_NS = "{http://www.w3.org/2005/Atom}"
 
 # Search engines choke on Unicode punctuation (titles copy-pasted from PDFs
 # are full of en-dashes and curly quotes).
@@ -127,13 +133,13 @@ class ArxivTitleResolver:
     # ── internals ──────────────────────────────────────────────────────
 
     async def _find(self, paper: Paper) -> str | None:
-        # The DDGS call is blocking and runs in a thread. Bounded, because an
-        # unbounded stall here would hold the pipeline's per-key lock and stop
-        # every other fetch behind it.
+        # Both search paths block on the network and run in a thread. Bounded,
+        # because an unbounded stall here would hold the pipeline's per-key lock
+        # and stop every other fetch behind it.
         try:
             ids = await asyncio.wait_for(
                 asyncio.get_running_loop().run_in_executor(
-                    None, self._search_sync, paper.title
+                    None, self._search_sync, paper
                 ),
                 timeout=settings.arxiv_search_timeout,
             )
@@ -148,12 +154,80 @@ class ArxivTitleResolver:
         client = await httpclient.get_client()
         return await self._verify(ids, paper, client)
 
-    def _search_sync(self, title: str) -> list[str]:
-        """Blocking DDGS search — run in a thread."""
+    def _search_sync(self, paper: Paper) -> list[str]:
+        """Blocking discovery — run in a thread. API first, web search second.
+
+        The order is the whole point. This resolver exists to rescue a paper the
+        publisher would not give us, so it has to work when the open web is
+        hostile — and it is: measured on 2026-10-04, every backend DDGS was
+        configured with was refusing us (Brave 429, Google 403, DuckDuckGo an
+        empty 202), so 23 of 27 title searches failed and a pile of paywalled
+        APS papers went undownloaded *while their preprints sat on arXiv*. The
+        arXiv API answered both of the papers that had just failed, in under a
+        second, with no search engine involved.
+
+        DDGS therefore stays only as a rescue for the case the API cannot serve:
+        a paper whose arXiv title differs too much from the published one to
+        survive the API's phrase match.
+        """
+        ids = self._api_ids(paper.title)
+        if ids:
+            return ids
+        return self._ddgs_ids(paper.title)
+
+    def _api_ids(self, title: str) -> list[str]:
+        """Ask arXiv's own API for the title. No search engine in the path.
+
+        Quoted so the query is a phrase match. A title-style search rather than
+        the default "all fields" one, because a quoted `all:` query over a full
+        sentence tends to return nothing at all.
+        """
+        query = re.sub(r'["\\]', " ", title[:200].translate(_UNICODE_FIX)).strip()
+        if not query:
+            return []
+        url = (
+            f"{_ARXIV_API}?search_query=ti:%22{query.replace(' ', '+')}%22"
+            "&start=0&max_results=10"
+        )
+        headers = {"User-Agent": httpclient.BROWSER_UA, "Accept": "application/atom+xml"}
+        try:
+            import httpx
+
+            # `export.arxiv.org` is HTTP-only for the API; the 301 to HTTPS is
+            # followed, and on https it answers 200 without a proxy from here.
+            resp = httpx.get(url, headers=headers, timeout=20.0, follow_redirects=True)
+            if resp.status_code != 200:
+                logger.info("arXiv API answered HTTP %d", resp.status_code)
+                return []
+            body = resp.text
+        except Exception as exc:  # noqa: BLE001 — discovery must not raise
+            logger.info("arXiv API query failed: %s: %s", type(exc).__name__, exc)
+            return []
+
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            logger.info("arXiv API returned unparseable XML: %s", exc)
+            return []
+
+        ids: list[str] = []
+        for entry in root.iter(f"{_ATOM_NS}entry"):
+            raw = (entry.findtext(f"{_ATOM_NS}id") or "").strip()
+            m = re.search(r"abs/([^/]+)$", raw)
+            if not m:
+                continue
+            arxiv_id = re.sub(r"v\d+$", "", m.group(1))
+            if arxiv_id and arxiv_id not in ids:
+                ids.append(arxiv_id)
+        logger.debug("arXiv API returned %d candidate(s) for %r", len(ids), title[:60])
+        return ids[:10]
+
+    def _ddgs_ids(self, title: str) -> list[str]:
+        """Blocking DDGS search — run in a thread. The rescue, not the default."""
         try:
             from ddgs import DDGS
         except ImportError:
-            logger.info("DDGS not installed — arXiv title search unavailable")
+            logger.info("DDGS not installed — arXiv web-search fallback unavailable")
             return []
 
         queries = [f'"{title[:200]}"']
