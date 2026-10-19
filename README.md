@@ -46,6 +46,7 @@ The essentials:
 |---|---|---|
 | `ACADEMIC_DATA_DIR` | library root: project memory JSON, `pdfs/`, `texts/`, `search_cache/`, `telemetry/` | `<MCP_HOME>/data` |
 | `MINERU_TOKEN` | MinerU cloud PDF→Markdown (required for conversion) | — |
+| `MINERU_ACCOUNT` / `MINERU_PASSWORD` | log in at mineru.net to renew `MINERU_TOKEN` automatically; the token itself expires (14 days, measured 2026-10-19) | — |
 | `ELSEVIER_API_KEY` | Scopus search + ScienceDirect download | — |
 | `OPENALEX_API_KEY` | OpenAlex search + citation chains | — |
 | `DEEPSEEK_API_KEY` | DeepSeek Search API — the web engine behind the arXiv title rescue | — |
@@ -97,6 +98,82 @@ local MinerU (GPU) and then PyMuPDF4LLM; both produced silently degraded text
 (lost formulas, broken tables, scrambled reading order) that a reading agent
 then summarised as authoritative. Failing loudly is better than fabricating
 structure.
+
+### Token lifetime and automatic renewal
+
+`MINERU_TOKEN` is not a permanent API key. It is the OpenXLab SSO token
+(`uaa-token`) that mineru.net issues when you log in, and it is a JWT with a hard
+**limited** lifetime — 14 days for the token issued on 2026-10-19 (the previous
+one lasted 90 days, so the number belongs to MinerU, not to this code). When it
+lapses, every conversion fails with
+
+```
+HTTP 401  {"msgCode": "A0202", "msg": "user authenticate failed"}
+```
+
+while paper downloads keep working — so the symptom is "only the conversion is
+broken". That is how the outage that began on 2026-10-11 went unnoticed for eight
+days.
+
+The service now manages this itself. Give it the account you use at
+<https://mineru.net/apiManage> (email, phone number or username) and its
+password:
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `MINERU_ACCOUNT` | login account (alias: `MINERU_USERNAME`) | — |
+| `MINERU_PASSWORD` | its password; leave empty to disable renewal | — |
+| `MINERU_TOKEN_RENEW` | master switch | `true` |
+| `MINERU_TOKEN_RENEW_DAYS` | renew while this many days remain | `7` |
+| `MINERU_TOKEN_FILE` | where a renewed token is stored | `~/.local/state/academic-mcp/mineru_token.json` |
+| `MINERU_LOGIN_TIMEOUT` | ceiling for one login, seconds | `180` |
+
+With both credentials set, the token is renewed:
+
+- **at startup**, when it is expired or within `MINERU_TOKEN_RENEW_DAYS` — in a
+  background thread, because a login drives a browser and startup must not wait;
+- **mid-flight on a 401** — the conversion renews once and retries, so the
+  caller never sees the failure. Parallel conversions share a single login (a
+  `stale`-token check under a lock), not one browser each.
+
+Manual control, and how to inspect it:
+
+```bash
+python -m academic_mcp.mineru_auth status           # expiry, source, is renewal configured
+python -m academic_mcp.mineru_auth probe            # is the stored token still accepted?
+python -m academic_mcp.mineru_auth renew            # log in now
+python -m academic_mcp.mineru_auth renew --visible  # if the captcha needs a human
+```
+
+The `health` tool gained a `mineru_token` block (`expires_at`, `days_left`,
+`expired`, `needs_renewal`, `source`, `renew_enabled`), so the state is visible
+without reading logs.
+
+**How it logs in.** There is no usable HTTP login: the SSO
+(`sso.openxlab.org.cn`) RSA-encrypts the password and demands an Aliyun captcha
+before it accepts `POST /gw/uaa-be/api/v1/login/byAccount` — without the captcha
+it answers `A0101 request parameter validation error` (measured). Renewal
+therefore drives the real login page with Camoufox: `https://mineru.net/apiManage/token`
+redirects straight to the SSO form, the account and password are filled in, 登录
+is clicked, and the `确认您不是机器人` checkbox (`#aliyunCaptcha-checkbox-icon`) is
+clicked whenever it appears. The token is then read from the `uaa-token` cookie
+and verified against the API before it is stored (a batch id that cannot exist
+answers "not found" when authenticated and 401 when not — no quota spent).
+
+**Where the renewed token goes.** Not into `.env`: the systemd unit runs with
+`ProtectSystem=strict` and only `~/.local/state/academic-mcp`, the data dir and
+the cache are writable, so a service-side `.env` edit would fail with `EROFS`.
+The token is written to `MINERU_TOKEN_FILE` (mode 0600, in a 0700 directory), and
+**whichever of that file and `MINERU_TOKEN` expires later wins** — pasting a
+fresh token into `.env` by hand still takes effect immediately, and a stale value
+in either place can never shadow a newer one.
+
+**When renewal fails**, it is logged and the conversion fails with the 401 as
+before; it is never silently degraded to a different converter. Usual causes: a
+wrong password, an account that requires an SMS/2FA step, or a captcha that
+escalated to a slider. For the last two, run `renew --visible` (on the desktop
+display, where you can drag the slider yourself) and the token is captured and
+stored as usual.
 
 ## Resolver order
 
@@ -155,6 +232,7 @@ academic-mcp/
 │   ├── server.py            # MCP tools (incl. contract / health)
 │   ├── pipeline.py          # cache → resolve → convert
 │   ├── mineru.py            # MinerU cloud API (the only converter)
+│   ├── mineru_auth.py       # token expiry, storage and automatic renewal
 │   ├── storage.py           # DOI→key, cache validity
 │   ├── httpclient.py        # pooled client, retries, proxy policy
 │   ├── websearch.py         # DeepSeek Search API (the arXiv rescue engine)
@@ -181,6 +259,11 @@ argument names, the `cwd → session_id` rule and the memory round-trip.
 
 - The service binds to `127.0.0.1` by default and keeps its keys in `.env`
   (never returned over the wire; `health` masks them).
+- Automatic MinerU renewal means `MINERU_PASSWORD` sits in clear text in `.env`.
+  Keep that file mode 0600 and owned by the service user; the account is the one
+  you use on mineru.net, so give it a unique password. A renewed token is stored
+  separately in `MINERU_TOKEN_FILE` (also 0600) and is never logged — only a
+  fingerprint (`first10…last4`) is ever printed.
 - `validate_doi` only authorises a DOI that appeared in this session's search
   results, so a stray DOI cannot trigger a download.
 - The browser fallback drives a real Firefox for CloudFlare challenges and

@@ -149,6 +149,54 @@ class Settings:
     mineru_timeout: int = field(default_factory=lambda: env_int("MINERU_TIMEOUT", 900))
     mineru_poll_interval: float = field(default_factory=lambda: env_float("MINERU_POLL_INTERVAL", 4.0))
 
+    # -- Token renewal ---------------------------------------------------
+    # MINERU_TOKEN is an OpenXLab SSO JWT with a short lifetime (14 days measured
+    # 2026-10-19; the one before that lasted 90, so the number is MinerU's to
+    # change); when it
+    # lapses every conversion fails with HTTP 401 (msgCode A0202) and the only
+    # cure is a fresh token from a browser login. These settings let the service
+    # do that login itself instead of waiting for an operator to notice.
+    #
+    # The account is whatever the SSO form accepts: email, phone number or
+    # username. There is no HTTP login endpoint that works without the Aliyun
+    # captcha, so renewal drives the real login page in a browser — see
+    # academic_mcp/mineru_auth.py. Leave the password empty to disable renewal
+    # and keep the manual workflow.
+    mineru_account: str = field(
+        default_factory=lambda: env("MINERU_ACCOUNT") or env("MINERU_USERNAME")
+    )
+    mineru_password: str = field(default_factory=lambda: env("MINERU_PASSWORD"))
+    # Master switch, so a deployment that must not keep a password can still
+    # get the expiry warning without ever attempting a login.
+    mineru_token_renew: bool = field(
+        default_factory=lambda: env_bool("MINERU_TOKEN_RENEW", True)
+    )
+    # Renew this many days BEFORE expiry. The login is cheap; a lapsed token in
+    # the middle of a literature review is not.
+    mineru_token_renew_days: int = field(
+        default_factory=lambda: env_int("MINERU_TOKEN_RENEW_DAYS", 7)
+    )
+    # Where the renewed token is persisted. Deliberately NOT .env: the systemd
+    # unit runs with ProtectSystem=strict and only `~/.local/state/academic-mcp`,
+    # the data dir and the cache are writable, so a service-side edit of .env
+    # would fail with EROFS.
+    mineru_token_file: Path = field(
+        default_factory=lambda: Path(
+            os.path.expanduser(
+                env("MINERU_TOKEN_FILE", "~/.local/state/academic-mcp/mineru_token.json")
+            )
+        )
+    )
+    # The page that redirects to the SSO login form; also the URL a browser
+    # session returns to once authenticated.
+    mineru_login_url: str = field(
+        default_factory=lambda: env("MINERU_LOGIN_URL", "https://mineru.net/apiManage/token")
+    )
+    # Hard ceiling for one login (page load + credentials + captcha + redirect).
+    mineru_login_timeout: int = field(
+        default_factory=lambda: env_int("MINERU_LOGIN_TIMEOUT", 180)
+    )
+
     # ── Elsevier / ScienceDirect API ───────────────────────────────────
     elsevier_api_key: str = field(default_factory=lambda: env("ELSEVIER_API_KEY"))
 
@@ -286,6 +334,18 @@ class Settings:
         return self.data_dir / "texts"
 
     @property
+    def can_renew(self) -> bool:
+        """Whether a token renewal could succeed at all.
+
+        The three conditions are independent on purpose: an operator may want
+        the expiry warning (``MINERU_TOKEN_RENEW=true``) while withholding the
+        password, or may have a password but have switched renewal off.
+        """
+        return bool(
+            self.mineru_token_renew and self.mineru_account and self.mineru_password
+        )
+
+    @property
     def search_cache_dir(self) -> Path:
         return self.data_dir / "search_cache"
 
@@ -373,6 +433,11 @@ class Settings:
             "mineru_configured": bool(self.mineru_token),
             "mineru_api_base": self.mineru_api_base,
             "mineru_model": self.mineru_model,
+            # Renewal is visible but the password never is — same rule as every
+            # other secret here: report whether it is configured, nothing more.
+            "mineru_account": self.mineru_account,
+            "mineru_renew_enabled": bool(self.mineru_token_renew and self.can_renew),
+            "mineru_renew_days": self.mineru_token_renew_days,
             "elsevier_configured": bool(self.elsevier_api_key),
             "openalex_configured": bool(self.openalex_api_key),
             "download_proxy": _mask(self.download_proxy) if self.download_proxy else None,

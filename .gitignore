@@ -1,5 +1,8 @@
 # secrets and local state — never commit these
+# `.env.*` covers editor and backup copies (.env.bak-<stamp>), which carry the
+# same live keys as `.env`; the example is the one file that must stay tracked.
 .env
+.env.*
 *.env
 !.env.example
 

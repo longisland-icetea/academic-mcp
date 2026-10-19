@@ -19,8 +19,11 @@ MinerU API v4 flow:
     GET  <full_zip_url>      → result ZIP
 
 Two API quirks that must survive any cleanup:
-* the OSS ``PUT`` requires an **empty** ``Content-Type`` (the signature covers
-  it) — httpx's default form type yields ``403 SignatureDoesNotMatch``;
+* the OSS ``PUT`` must send the file's own MIME type in ``Content-Type``,
+  because the presigned URL's signature covers it — measured 2026-10-19:
+  ``application/pdf`` for .pdf is accepted while ``application/octet-stream``
+  and an empty value both answer ``403 SignatureDoesNotMatch``. (Before that
+  date the server accepted an EMPTY content type. The signing side changed.)
 * ``Content-Length`` must be explicit — OSS rejects chunked uploads.
 """
 
@@ -30,6 +33,7 @@ import hashlib
 import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -43,7 +47,7 @@ from typing import Any
 
 import httpx
 
-from . import storage
+from . import mineru_auth, storage
 from .config import settings
 from .markdown import clean_markdown
 
@@ -76,6 +80,21 @@ DOC_CACHE_DIR = Path(
 
 class MineruError(RuntimeError):
     """Conversion failed. There is deliberately no fallback converter."""
+
+
+class AuthExpired(MineruError):
+    """The token was rejected (401/403).
+
+    Separated from ``MineruError`` because it is the one failure the service
+    can repair by itself: ``convert_document`` catches this, renews the token
+    and retries once. ``token`` is the credential that failed, so a concurrent
+    renewal is not repeated (see :func:`mineru_auth.renew`).
+    """
+
+    def __init__(self, message: str, token: str = "", status: int = 0) -> None:
+        super().__init__(message)
+        self.token = token
+        self.status = status
 
 
 class _Transient(RuntimeError):
@@ -114,7 +133,7 @@ class Conversion:
 
 def _headers() -> dict[str, str]:
     return {
-        "Authorization": f"Bearer {settings.mineru_token}",
+        "Authorization": f"Bearer {mineru_auth.current_token()}",
         "Content-Type": "application/json",
         "Accept": "*/*",
     }
@@ -134,10 +153,22 @@ def _client() -> Iterator[httpx.Client]:
 
 def _check_token_failure(resp: httpx.Response) -> None:
     if resp.status_code in (401, 403):
-        raise MineruError(
-            f"MinerU rejected the token (HTTP {resp.status_code}). The token has a "
-            "limited lifetime — get a fresh one at https://mineru.net/apiManage and "
-            "update MINERU_TOKEN."
+        # MinerU answers {"msgCode": "A0202", "msg": "user authenticate failed"}
+        # for an expired token. Say WHEN it expired: the difference between
+        # "wrong token" and "the clock ran out" is the whole diagnosis.
+        token = ""
+        request = getattr(resp, "request", None)
+        if request is not None:
+            token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+        info = mineru_auth.current(refresh=True)
+        detail = f" — {info.label()}" if info is not None else ""
+        raise AuthExpired(
+            f"MinerU rejected the token (HTTP {resp.status_code}){detail}. The token is "
+            "an OpenXLab SSO token with a limited lifetime; get a fresh one at "
+            "https://mineru.net/apiManage, or set MINERU_ACCOUNT + MINERU_PASSWORD in "
+            ".env so the service renews it automatically.",
+            token=token,
+            status=resp.status_code,
         )
 
 
@@ -183,18 +214,45 @@ def _create_task(
     return batch_id, list(data.get("file_urls") or [])
 
 
+def _upload_content_type(path: Path) -> str:
+    """The MIME type MinerU signed this file's upload URL with.
+
+    Measured 2026-10-19: the presigned OSS URL covers the file's OWN MIME type
+    and nothing else — pdf → ``application/pdf``, png → ``image/png``, docx →
+    the long OOXML type all answer 200, while ``application/octet-stream`` and
+    an empty ``Content-Type`` answer ``403 SignatureDoesNotMatch``. Until this
+    date the server accepted an empty ``Content-Type``, so the old code sent
+    one; the signing side changed, not us. ``Content-Type`` is part of the
+    signature, so it has to match exactly.
+    """
+    guessed, _ = mimetypes.guess_type(path.name)
+    return guessed or "application/octet-stream"
+
+
 def _put_file(upload_url: str, path: Path) -> None:
     data = path.read_bytes()
     with httpx.Client(timeout=300, trust_env=False) as client:
         resp = client.put(
             upload_url,
             content=data,
-            headers={"Content-Type": "", "Content-Length": str(len(data))},
+            headers={
+                "Content-Type": _upload_content_type(path),
+                "Content-Length": str(len(data)),
+            },
         )
     if resp.status_code >= 500 or resp.status_code == 429:
         raise _Transient(f"HTTP {resp.status_code}")
     if resp.status_code != 200:
-        raise MineruError(f"MinerU upload failed: HTTP {resp.status_code} {resp.text[:200]}")
+        hint = ""
+        if resp.status_code == 403 and "SignatureDoesNotMatch" in resp.text:
+            hint = (
+                " — the upload URL is presigned with the file's MIME type "
+                f"({_upload_content_type(path)!r} was sent); if MinerU changed its "
+                "signing again, this is where to look."
+            )
+        raise MineruError(
+            f"MinerU upload failed: HTTP {resp.status_code} {resp.text[:200]}{hint}"
+        )
 
 
 def _poll(client: httpx.Client, batch_id: str) -> dict[str, Any]:
@@ -492,10 +550,11 @@ def convert_document(
     Raises:
         MineruError: on any failure — no fallback converter exists.
     """
-    if not settings.mineru_token:
+    if mineru_auth.current() is None:
         raise MineruError(
-            "MINERU_TOKEN is not configured. Get one at https://mineru.net/apiManage "
-            "and export MINERU_TOKEN."
+            "MINERU_TOKEN is not configured and no renewed token is stored. Get one at "
+            "https://mineru.net/apiManage and set MINERU_TOKEN, or set MINERU_ACCOUNT + "
+            "MINERU_PASSWORD in .env so renewal happens automatically."
         )
 
     requested_model = model
@@ -622,6 +681,26 @@ def convert_document(
             if attempt == 2:
                 raise MineruError(f"MinerU conversion failed: {exc}") from exc
             time.sleep(3)
+        except AuthExpired as exc:
+            # The one failure worth repairing here: a short-lived token expiring is
+            # routine, and the whole point of mineru_auth is that the caller
+            # never sees it. Keep the attempt inside the same budget (attempt 2
+            # is the retry), and do not renew when the credentials are absent.
+            if attempt == 2 or not settings.can_renew:
+                raise
+            logger.warning(
+                "MinerU rejected the token (HTTP %s) — renewing it and retrying", exc.status
+            )
+            try:
+                mineru_auth.renew(force=True, stale=exc.token)
+            except mineru_auth.MineruAuthError as renew_exc:
+                raise AuthExpired(
+                    f"MinerU rejected the token and automatic renewal failed: {renew_exc}. "
+                    "Paste a fresh MINERU_TOKEN from https://mineru.net/apiManage into "
+                    ".env, or run `python -m academic_mcp.mineru_auth renew --visible`.",
+                    token=exc.token,
+                    status=exc.status,
+                ) from renew_exc
         except MineruError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -697,10 +776,11 @@ def convert_paper_pdf(
         if cached:
             return cached
 
-    if not settings.mineru_token:
+    if mineru_auth.current() is None:
         raise MineruError(
             "MINERU_TOKEN is not configured — PDF→Markdown conversion is unavailable. "
-            "Get a token at https://mineru.net/apiManage and export MINERU_TOKEN."
+            "Get a token at https://mineru.net/apiManage and set MINERU_TOKEN, or set "
+            "MINERU_ACCOUNT + MINERU_PASSWORD for automatic renewal."
         )
 
     last: Exception | None = None

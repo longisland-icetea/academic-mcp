@@ -17,7 +17,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from . import __version__, httpclient, mineru, pipeline, storage
+from . import __version__, httpclient, mineru, mineru_auth, pipeline, storage
 from .agent import tools as agent_tools
 from .config import settings
 from .resolvers import STATS
@@ -278,6 +278,10 @@ async def health() -> str:
         "contract_version": CONTRACT_VERSION,
         "python": platform.python_version(),
         "config": settings.as_public_dict(),
+        # Expiry and (masked) renewal state. A lapsed MinerU token is the one
+        # failure that disables every conversion while downloads keep working,
+        # so its remaining lifetime belongs in the first thing an operator reads.
+        "mineru_token": mineru_auth.status(),
         "cache": {
             "pdfs": _count(settings.pdf_dir, "*.pdf"),
             "markdown": _count(settings.md_dir, "*.md"),
@@ -360,8 +364,10 @@ def main() -> None:
         settings.port,
         settings.data_dir,
     )
-    if not settings.mineru_token:
-        logger.warning("MINERU_TOKEN is unset — PDF→Markdown conversion will fail")
+    # Reports the token's expiry and, when MINERU_ACCOUNT/MINERU_PASSWORD are
+    # set, renews it in the background — never on the startup path, because a
+    # browser login can take a minute or more.
+    mineru_auth.startup_check()
     if not settings.elsevier_api_key:
         logger.info("ELSEVIER_API_KEY unset — ScienceDirect resolver disabled")
 
