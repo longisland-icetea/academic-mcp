@@ -8,6 +8,7 @@ DSH `academic` agent preset, which contains no Python at all.
 ```
 client (any MCP host)  ──JSON-RPC /mcp──▶  academic-mcp :8790
                                              ├─ Scopus + OpenAlex    (search, citation chains)
+                                             ├─ DeepSeek Search API  (arXiv title rescue)
                                              ├─ project memory JSON  (notes, findings, progress)
                                              ├─ arXiv / Elsevier / browser → PDF
                                              └─ MinerU cloud API     (PDF → Markdown)
@@ -47,6 +48,8 @@ The essentials:
 | `MINERU_TOKEN` | MinerU cloud PDF→Markdown (required for conversion) | — |
 | `ELSEVIER_API_KEY` | Scopus search + ScienceDirect download | — |
 | `OPENALEX_API_KEY` | OpenAlex search + citation chains | — |
+| `DEEPSEEK_API_KEY` | DeepSeek Search API — the web engine behind the arXiv title rescue | — |
+| `ARXIV_SEARCH_ENGINE` | `auto` / `deepseek` / `ddgs` / `none`: rescue engine **after** the arXiv API comes back empty | `auto` |
 | `DOWNLOAD_PROXY` | publisher/API access, and the rescue route in `failover` mode; empty = direct only | — |
 | `DOWNLOAD_PROXY_MODE` | `primary` / `fallback` / `failover` / `none` — governs the **browser** resolver as well as the HTTP client | `fallback` |
 | `GFW_PROXY` | primary route for OpenAlex search / arXiv (failover hop applies here too) | — |
@@ -57,7 +60,10 @@ Full list with defaults and tuning knobs: [`.env.example`](.env.example).
 There are two proxy settings and one Elsevier credential: `DOWNLOAD_PROXY`
 (publisher/API access, and the rescue route in `failover` mode) and
 `GFW_PROXY` (arXiv/search engines/OpenAlex). `ELSEVIER_API_KEY` alone is
-enough for metadata; an institutional insttoken is not supported.
+enough for metadata; an institutional insttoken is not supported. DeepSeek's
+Search API is the exception to both: it is reached directly at
+`api.deepseek.com`, the same host the model API uses, so it never goes through
+`GFW_PROXY`.
 
 Restart the service after editing (configuration is read once at startup):
 
@@ -108,8 +114,8 @@ Cheap and reliable first, expensive and fragile last:
    per exit, because entitlements are per-IP: an exit that is a subscriber for
    one publisher is a stranger for the next, and the second route is what
    rescues the first.
-5. `arxiv-title-search` — find the preprint by title (arXiv API + verification,
-   with DDGS as a rescue for titles the API's phrase match cannot reach)
+5. `arxiv-title-search` — find the preprint by title (arXiv API first, then a
+   web engine, with every candidate verified)
 
 The last one is a fallback for *content*, not access: when every publisher path
 is paywalled, an arXiv preprint of the same paper is still worth reading. It
@@ -118,6 +124,19 @@ runs last so the version-of-record wins when reachable. Candidates are verified
 failing. It asks arXiv's own API first and keeps web search as the rescue,
 because a resolver whose job is to work when the publisher refused us cannot
 depend on search engines that may be refusing us too.
+
+The rescue engine is DeepSeek's **Search API**, not DDGS. Measured on
+2026-10-04, every DDGS backend was refusing this host (Brave 429, Google 403,
+DuckDuckGo an empty 202): 23 of 27 title searches failed while the preprints sat
+on arXiv. DeepSeek answers `site:arxiv.org "<title>"` (then the leading six
+words, for titles the phrase match cannot reach) from one endpoint in ~0.5 s,
+directly — no proxy. It is billed per successful request (5 CNY / 1000, empty
+results free) and capped at 5 QPS per account; a rescued paper costs at most two
+requests. Only the result URLs are read: the arXiv ID they carry is a lead, and
+`_verify` still checks every candidate against arxiv.org metadata before a byte
+is downloaded. `ARXIV_SEARCH_ENGINE=ddgs` restores the old engine, `none` keeps
+the API alone; with no `DEEPSEEK_API_KEY` the default (`auto`) falls back to
+DDGS so an existing deployment keeps working.
 
 ## Display for the browser
 
@@ -138,6 +157,7 @@ academic-mcp/
 │   ├── mineru.py            # MinerU cloud API (the only converter)
 │   ├── storage.py           # DOI→key, cache validity
 │   ├── httpclient.py        # pooled client, retries, proxy policy
+│   ├── websearch.py         # DeepSeek Search API (the arXiv rescue engine)
 │   ├── validate.py          # session-scoped DOI authorization
 │   ├── markdown.py          # outline + page→line map
 │   ├── resolvers/           # arxiv, elsevier, publisher, camoufox

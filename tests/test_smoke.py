@@ -1028,10 +1028,14 @@ def test_arxiv_search_prefers_the_api_and_keeps_ddgs_as_the_rescue(monkeypatch):
 
     Pinned as an ORDER because the reverse silently restores the failure: a
     dead search engine would then be consulted before the source that works.
+    The engine is pinned to DDGS here because that is what this case is about;
+    the default-engine case is the next test.
     """
+    from academic_mcp.config import settings
     from academic_mcp.resolvers.arxiv import ArxivTitleResolver
     from academic_mcp.resolvers.base import Paper
 
+    monkeypatch.setattr(settings, "arxiv_search_engine", "ddgs")
     resolver = ArxivTitleResolver()
     calls: list[str] = []
 
@@ -1053,6 +1057,331 @@ def test_arxiv_search_prefers_the_api_and_keeps_ddgs_as_the_rescue(monkeypatch):
     monkeypatch.setattr(resolver, "_api_ids", lambda title: (calls.append("api"), [])[1])
     assert resolver._search_sync(paper) == ["9999.99999"]
     assert calls == ["api", "ddgs"]
+
+
+def test_arxiv_search_uses_the_configured_engine_after_the_api(monkeypatch):
+    """A configured key makes DeepSeek the engine; `none` keeps the API alone."""
+    from academic_mcp.config import settings
+    from academic_mcp.resolvers.arxiv import ArxivTitleResolver
+    from academic_mcp.resolvers.base import Paper
+
+    resolver = ArxivTitleResolver()
+    calls: list[str] = []
+    monkeypatch.setattr(resolver, "_api_ids", lambda title: (calls.append("api"), [])[1])
+    monkeypatch.setattr(
+        resolver, "_deepseek_ids",
+        lambda title: (calls.append("deepseek"), ["2311.04560"])[1],
+    )
+    monkeypatch.setattr(
+        resolver, "_ddgs_ids", lambda title: (calls.append("ddgs"), ["9999.99999"])[1]
+    )
+    monkeypatch.setattr(settings, "arxiv_search_engine", "auto")
+    monkeypatch.setattr(settings, "deepseek_api_key", "sk-test-key")
+
+    paper = Paper(doi="10.1103/x", title="Some Title")
+    assert resolver._search_sync(paper) == ["2311.04560"]
+    assert calls == ["api", "deepseek"], "DeepSeek is the engine once it has a key"
+
+    # No engine at all: the API is the only discovery path.
+    calls.clear()
+    monkeypatch.setattr(settings, "arxiv_search_engine", "none")
+    assert resolver._search_sync(paper) == []
+    assert calls == ["api"]
+
+
+def test_arxiv_web_engine_follows_the_key_and_the_setting(monkeypatch):
+    from academic_mcp.config import settings
+
+    monkeypatch.setattr(settings, "arxiv_search_engine", "auto")
+    monkeypatch.setattr(settings, "deepseek_api_key", "sk-test-key")
+    assert settings.arxiv_web_engine == "deepseek"
+    monkeypatch.setattr(settings, "deepseek_api_key", "")
+    assert settings.arxiv_web_engine == "ddgs", "no key must not lose the rescue path"
+    monkeypatch.setattr(settings, "arxiv_search_engine", "ddgs")
+    assert settings.arxiv_web_engine == "ddgs"
+    monkeypatch.setattr(settings, "arxiv_search_engine", "none")
+    assert settings.arxiv_web_engine is None
+
+
+# ── DeepSeek Search: the web engine behind arxiv-title-search ────────────────
+#
+# DDGS was measured refusing every request from this host on 2026-10-04 (Brave
+# 429, Google 403, DuckDuckGo an empty 202), so the rescue engine is now
+# DeepSeek's Search API. What is pinned here is the contract: one POST to the
+# documented endpoint, only the result URLs read, every failure turning into
+# "no candidates" rather than an exception, and the API's 1–128 character query
+# limit respected.
+
+def _deepseek_settings(monkeypatch, **overrides):
+    from academic_mcp.config import settings
+
+    values = {
+        "deepseek_api_key": "sk-test-key",
+        "deepseek_search_base": "https://api.deepseek.com",
+        "arxiv_search_engine": "auto",
+    }
+    values.update(overrides)
+    for name, value in values.items():
+        monkeypatch.setattr(settings, name, value)
+    return settings
+
+
+def _fake_httpx(monkeypatch, *, status=200, body=None, posts=None, raises=None):
+    """Stub `httpx.Client`, which is how `websearch.search` reaches the network."""
+    import httpx
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = status
+            self.text = json.dumps(body) if body is not None else ""
+
+        def json(self):
+            if body is None:
+                raise ValueError("no json")
+            return body
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def post(self, url, **kwargs):
+            if posts is not None:
+                posts.append((url, kwargs, self.kwargs))
+            if raises is not None:
+                raise raises
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+
+
+def test_deepseek_search_posts_to_the_documented_endpoint(monkeypatch):
+    from academic_mcp import websearch
+
+    posts: list[tuple] = []
+    _deepseek_settings(monkeypatch)
+    _fake_httpx(
+        monkeypatch,
+        body={"results": [{"url": "https://arxiv.org/abs/2311.04560"}]},
+        posts=posts,
+    )
+
+    results = websearch.search('site:arxiv.org "A Title"', count=20)
+    assert results == [{"url": "https://arxiv.org/abs/2311.04560"}]
+
+    url, kwargs, client_kwargs = posts[0]
+    assert url == "https://api.deepseek.com/v1/tools/search"
+    assert kwargs["json"] == {"query": 'site:arxiv.org "A Title"', "count": 20}
+    assert kwargs["headers"]["Authorization"] == "Bearer sk-test-key"
+    assert kwargs["headers"]["Content-Type"] == "application/json"
+    # The endpoint is the DeepSeek API host itself: no shell proxy, no GFW hop.
+    assert client_kwargs["trust_env"] is False
+
+
+def test_deepseek_search_clamps_count_to_the_documented_range(monkeypatch):
+    from academic_mcp import websearch
+
+    posts: list[tuple] = []
+    _deepseek_settings(monkeypatch)
+    _fake_httpx(monkeypatch, body={"results": []}, posts=posts)
+
+    websearch.search("x", count=500)
+    websearch.search("x", count=0)
+    assert [post[1]["json"]["count"] for post in posts] == [50, 1]
+
+
+def test_deepseek_search_without_a_key_makes_no_request(monkeypatch):
+    from academic_mcp import websearch
+
+    posts: list[tuple] = []
+    _deepseek_settings(monkeypatch, deepseek_api_key="")
+    _fake_httpx(monkeypatch, body={"results": [{"url": "https://arxiv.org/abs/1"}]}, posts=posts)
+    assert websearch.search("x") == []
+    assert posts == []
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 404])
+def test_deepseek_search_client_errors_are_not_retried(monkeypatch, status):
+    from academic_mcp import websearch
+
+    posts: list[tuple] = []
+    _deepseek_settings(monkeypatch)
+    _fake_httpx(monkeypatch, status=status, posts=posts)
+    assert websearch.search("x") == []
+    assert len(posts) == 1, "the docs say do not retry an unmodified 4xx"
+
+
+def test_deepseek_search_retries_a_429_once(monkeypatch):
+    from academic_mcp import websearch
+
+    posts: list[tuple] = []
+    _deepseek_settings(monkeypatch)
+    _fake_httpx(monkeypatch, status=429, posts=posts)
+    monkeypatch.setattr(websearch.time, "sleep", lambda seconds: None)
+    assert websearch.search("x") == []
+    assert len(posts) == 2
+
+
+@pytest.mark.parametrize("status", [408, 500, 504])
+def test_deepseek_search_retries_a_timeout_or_server_error_once(monkeypatch, status):
+    from academic_mcp import websearch
+
+    posts: list[tuple] = []
+    _deepseek_settings(monkeypatch)
+    _fake_httpx(monkeypatch, status=status, posts=posts)
+    monkeypatch.setattr(websearch.time, "sleep", lambda seconds: None)
+    assert websearch.search("x") == []
+    assert len(posts) == 2
+
+
+def test_deepseek_search_failures_never_raise(monkeypatch):
+    """Discovery is the last resolver in the chain: an exception is a bug."""
+    import httpx
+
+    from academic_mcp import websearch
+
+    posts: list[tuple] = []
+    _deepseek_settings(monkeypatch)
+
+    _fake_httpx(monkeypatch, posts=posts, raises=httpx.ConnectTimeout("blackholed"))
+    assert websearch.search("x") == []
+
+    _fake_httpx(monkeypatch, body=None, posts=posts)  # 200 with no JSON body
+    assert websearch.search("x") == []
+
+    _fake_httpx(monkeypatch, body={"results": "not a list"}, posts=posts)
+    assert websearch.search("x") == []
+
+    _fake_httpx(monkeypatch, body={"results": [{"url": "a"}, "junk", 7]}, posts=posts)
+    assert websearch.search("x") == [{"url": "a"}]
+
+    assert websearch.search("") == []
+
+
+def test_build_queries_stays_within_the_api_limit(monkeypatch):
+    from academic_mcp import websearch
+
+    queries = websearch.build_queries("A Title " + "word " * 60)
+    assert len(queries) == 2
+    assert queries[0].startswith('site:arxiv.org "') and queries[0].endswith('"')
+    assert '"' not in queries[1], "the loose query is words, not a phrase"
+    assert all(len(query) <= websearch.MAX_QUERY_CHARS for query in queries)
+    assert websearch.build_queries("   ") == []
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://arxiv.org/abs/2311.04560", "2311.04560"),
+        ("https://arxiv.org/pdf/2311.04560v2", "2311.04560"),
+        ("https://arxiv.org/html/2311.04560v1#1", "2311.04560"),
+        ("https://ar5iv.labs.arxiv.org/html/1306.0698#5", "1306.0698"),
+        ("http://www.arXiv.org/abs/2502.17569#1", "2502.17569"),
+        ("http://xxx.itp.ac.cn/abs/1306.0698", "1306.0698"),
+        ("https://arxiv-org.ezproxy.obspm.fr/html/2607.07802v1#2", "2607.07802"),
+        ("https://doi.org/10.48550/arXiv.2311.04560", "2311.04560"),
+        ("https://arxiv.org/abs/hep-th/9901001", "hep-th/9901001"),
+        # Listing and search pages carry no ID.
+        ("https://arxiv.org/list/quant-ph/2023?skip=355&show=2000#29", None),
+        ("https://web3.arxiv.org/search/cond-mat?searchtype=author&query=X", None),
+        ("https://example.com/article/10.1103/PhysRevA.87.052502", None),
+        ("", None),
+    ],
+)
+def test_arxiv_id_from_url(url, expected):
+    from academic_mcp.resolvers.arxiv import arxiv_id_from_url
+
+    assert arxiv_id_from_url(url) == expected
+
+
+def test_arxiv_ids_from_urls_keeps_rank_order_and_dedupes():
+    from academic_mcp.resolvers.arxiv import arxiv_ids_from_urls
+
+    urls = [
+        "https://ar5iv.labs.arxiv.org/html/2311.04560#5",
+        "https://arxiv.org/list/quant-ph/2023?skip=1",
+        "https://arxiv.org/abs/2311.04560v2",
+        "https://arxiv.org/abs/1306.0698",
+        "https://arxiv.org/abs/2502.17569",
+    ]
+    assert arxiv_ids_from_urls(urls) == ["2311.04560", "1306.0698", "2502.17569"]
+    assert arxiv_ids_from_urls(urls, limit=2) == ["2311.04560", "1306.0698"]
+
+
+def test_deepseek_ids_reads_the_urls_and_stops_at_the_first_hit(monkeypatch):
+    from academic_mcp import websearch
+    from academic_mcp.resolvers.arxiv import ArxivTitleResolver
+
+    seen: list[str] = []
+
+    def fake_search(query, **kwargs):
+        seen.append(query)
+        return [
+            {"url": "https://ar5iv.labs.arxiv.org/html/2311.04560#5"},
+            {"url": "https://arxiv.org/list/quant-ph/2023?skip=355"},
+            {"url": "https://doi.org/10.48550/arXiv.2502.17569"},
+            {"url": None},
+        ]
+
+    monkeypatch.setattr(websearch, "search", fake_search)
+    ids = ArxivTitleResolver()._deepseek_ids(
+        "Fast Generation of GHZ-like States Using Collective-Spin XYZ Model"
+    )
+    # Ranked order, no listing page, no duplicate, no crash on a null url.
+    assert ids == ["2311.04560", "2502.17569"]
+    # Titles over six words get a loose second query, but a hit on the first
+    # means it is never paid for.
+    assert len(seen) == 1
+    assert seen[0].startswith('site:arxiv.org "Fast Generation')
+
+
+def test_deepseek_ids_falls_back_to_the_loose_query(monkeypatch):
+    from academic_mcp import websearch
+    from academic_mcp.resolvers.arxiv import ArxivTitleResolver
+
+    seen: list[str] = []
+
+    def fake_search(query, **kwargs):
+        seen.append(query)
+        if len(seen) == 1:
+            return [{"url": "https://arxiv.org/list/cond-mat/2025-02?skip=1"}]
+        return [{"url": "https://arxiv.org/abs/2502.17569"}]
+
+    monkeypatch.setattr(websearch, "search", fake_search)
+    ids = ArxivTitleResolver()._deepseek_ids(
+        "Shining Light on Collective Modes in Moire Fractional Chern Insulators"
+    )
+    assert ids == ["2502.17569"]
+    assert len(seen) == 2
+    assert '"' not in seen[1]
+
+
+def test_deepseek_ids_never_raises(monkeypatch):
+    from academic_mcp import websearch
+    from academic_mcp.resolvers.arxiv import ArxivTitleResolver
+
+    def boom(query, **kwargs):
+        raise RuntimeError("engine down")
+
+    monkeypatch.setattr(websearch, "search", boom)
+    assert ArxivTitleResolver()._deepseek_ids("Some Title") == []
+
+
+async def test_health_reports_the_search_engine_without_the_key(monkeypatch):
+    from academic_mcp.config import settings
+
+    monkeypatch.setattr(settings, "deepseek_api_key", "sk-secret-do-not-print")
+    monkeypatch.setattr(settings, "arxiv_search_engine", "auto")
+    payload = json.loads(await health())
+    config = payload["config"]
+    assert config["deepseek_configured"] is True
+    assert config["arxiv_search_engine"] == "deepseek"
+    assert "sk-secret-do-not-print" not in json.dumps(config)
 
 
 async def test_arxiv_api_hit_is_verified_before_it_is_downloaded(monkeypatch):

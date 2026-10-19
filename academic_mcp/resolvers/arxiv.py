@@ -14,8 +14,9 @@ import difflib
 import logging
 import re
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable
 
-from .. import httpclient
+from .. import httpclient, websearch
 from ..config import settings
 from .base import Paper
 
@@ -23,7 +24,21 @@ logger = logging.getLogger("academic_mcp.resolvers.arxiv")
 
 _NEW_ID = re.compile(r"^(\d{4}\.\d{4,5})(?:v\d+)?$")
 _OLD_ID = re.compile(r"^([a-z-]+(?:\.[A-Z]{2})?/\d{7})(?:v\d+)?$")
-_ARXIV_ANY = re.compile(r"arxiv\.org/(?:abs|pdf|html)/(\d{4}\.\d{4,5})")
+
+# Any URL that *is* an arXiv paper page: arxiv.org itself, the ar5iv/web3
+# mirrors, an EZproxy host, or the Chinese mirror.  The host is deliberately not
+# checked — the ID shape plus the verification downstream is what makes a
+# candidate safe, and a mirror is exactly what a search engine returns when
+# arxiv.org itself ranked lower.  Listing and search pages carry no ID.
+_ARXIV_ID_IN_PATH = re.compile(
+    r"/(?:abs|pdf|html)/([A-Za-z-]+(?:\.[A-Za-z]{2})?/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?",
+    re.IGNORECASE,
+)
+# The DOI form of an arXiv ID: 10.48550/arXiv.2311.04560.
+_ARXIV_DOI_IN_URL = re.compile(
+    r"10\.48550/(?:arXiv\.)?([A-Za-z-]+(?:\.[A-Za-z]{2})?/\d{7}|\d{4}\.\d{4,5})",
+    re.IGNORECASE,
+)
 
 # The arXiv API's own title search. Quoted, because an unquoted query is an
 # OR over every word and returns a page of unrelated papers for any title.
@@ -38,6 +53,17 @@ _UNICODE_FIX = str.maketrans(
         "‘": "'", "’": "'", "“": '"', "”": '"',
     }
 )
+
+
+def _title_text(title: str, limit: int = 200) -> str:
+    """A title made safe as a query fragment.
+
+    Quotes and backslashes out of the way (a search API would read them as an
+    unterminated phrase), Unicode dashes/quotes normalised, whitespace
+    collapsed.  Shared by every discovery path so they all ask the same thing.
+    """
+    text = re.sub(r'["\\]', " ", title[:limit].translate(_UNICODE_FIX))
+    return " ".join(text.split())
 
 
 def extract_arxiv_id(doi: str) -> str | None:
@@ -56,6 +82,38 @@ def extract_arxiv_id(doi: str) -> str | None:
         return rest[6:] if rest.lower().startswith("arxiv.") else rest
     m = _NEW_ID.match(doi.strip()) or _OLD_ID.match(doi.strip())
     return m.group(1) if m else None
+
+
+def arxiv_id_from_url(url: str) -> str | None:
+    """The arXiv ID a search-result URL points at, else None.
+
+    Accepts every shape a search engine has been observed to return: an
+    ``arxiv.org/abs|pdf|html`` page, the ar5iv/web3 mirrors, an EZproxy host,
+    the Chinese mirror, and the ``10.48550/arXiv.<id>`` DOI form.  Listing and
+    search pages (``/list/...``, ``/search?...``) yield None.
+
+    >>> arxiv_id_from_url("https://ar5iv.labs.arxiv.org/html/2311.04560#5")
+    '2311.04560'
+    >>> arxiv_id_from_url("https://arxiv.org/list/quant-ph/2023?skip=5") is None
+    True
+    """
+    for pattern in (_ARXIV_ID_IN_PATH, _ARXIV_DOI_IN_URL):
+        match = pattern.search(url or "")
+        if match:
+            return match.group(1)
+    return None
+
+
+def arxiv_ids_from_urls(urls: Iterable[str], limit: int = 10) -> list[str]:
+    """The distinct arXiv IDs among ``urls``, in the order the engine ranked them."""
+    ids: list[str] = []
+    for url in urls:
+        arxiv_id = arxiv_id_from_url(url)
+        if arxiv_id and arxiv_id not in ids:
+            ids.append(arxiv_id)
+            if len(ids) >= limit:
+                break
+    return ids
 
 
 def _candidate_urls(arxiv_id: str) -> list[str]:
@@ -99,10 +157,13 @@ class ArxivDirectResolver:
 class ArxivTitleResolver:
     """Find the arXiv preprint by title, then download it.
 
-    Uses DDGS (multi-engine, ``site:arxiv.org``) and verifies each candidate
-    against arxiv.org metadata before accepting: fetching the *wrong* paper
-    is far worse than failing, because the reading subagent will write
-    confident notes about it.
+    Discovery is two-step: the arXiv API answers a ``ti:`` phrase query first
+    (authoritative, free, no search engine in the path); when it has nothing,
+    a web engine is asked for ``site:arxiv.org`` pages carrying the title —
+    DeepSeek's Search API by default, DDGS as an opt-in alternative.  Every
+    candidate from either step is verified against arxiv.org metadata before
+    accepting it: fetching the *wrong* paper is far worse than failing,
+    because the reading subagent will write confident notes about it.
     """
 
     name = "arxiv-title-search"
@@ -155,7 +216,7 @@ class ArxivTitleResolver:
         return await self._verify(ids, paper, client)
 
     def _search_sync(self, paper: Paper) -> list[str]:
-        """Blocking discovery — run in a thread. API first, web search second.
+        """Blocking discovery — run in a thread. API first, web engine second.
 
         The order is the whole point. This resolver exists to rescue a paper the
         publisher would not give us, so it has to work when the open web is
@@ -166,14 +227,21 @@ class ArxivTitleResolver:
         arXiv API answered both of the papers that had just failed, in under a
         second, with no search engine involved.
 
-        DDGS therefore stays only as a rescue for the case the API cannot serve:
-        a paper whose arXiv title differs too much from the published one to
-        survive the API's phrase match.
+        So the API is always the first step. A web engine is only reached when
+        it has nothing — a paper whose arXiv title differs too much from the
+        published one to survive the API's phrase match. Which engine that is:
+        `settings.arxiv_web_engine` (DeepSeek Search by default, DDGS opt-in,
+        `none` for the API only).
         """
         ids = self._api_ids(paper.title)
         if ids:
             return ids
-        return self._ddgs_ids(paper.title)
+        engine = settings.arxiv_web_engine
+        if engine == "deepseek":
+            return self._deepseek_ids(paper.title)
+        if engine == "ddgs":
+            return self._ddgs_ids(paper.title)
+        return []
 
     def _api_ids(self, title: str) -> list[str]:
         """Ask arXiv's own API for the title. No search engine in the path.
@@ -182,7 +250,7 @@ class ArxivTitleResolver:
         the default "all fields" one, because a quoted `all:` query over a full
         sentence tends to return nothing at all.
         """
-        query = re.sub(r'["\\]', " ", title[:200].translate(_UNICODE_FIX)).strip()
+        query = _title_text(title)
         if not query:
             return []
         url = (
@@ -222,18 +290,54 @@ class ArxivTitleResolver:
         logger.debug("arXiv API returned %d candidate(s) for %r", len(ids), title[:60])
         return ids[:10]
 
+    def _deepseek_ids(self, title: str) -> list[str]:
+        """DeepSeek's Search API — the default engine. Run in a thread.
+
+        Only the result URLs are used. A listing or search page carries no ID
+        and is skipped; a mirror or EZproxy host carries the same ID as
+        arxiv.org and is accepted, because `_verify` checks every ID against
+        arxiv.org itself before a byte is downloaded.
+
+        The response's `summary`/`content` fields are not requested: the URL is
+        the only thing discovery needs, and leaving them out keeps the response
+        small.
+        """
+        found: list[str] = []
+        for query in websearch.build_queries(_title_text(title)):
+            try:
+                results = websearch.search(query)
+            except Exception as exc:  # noqa: BLE001 — discovery must not raise
+                logger.info(
+                    "DeepSeek search failed: %s: %s", type(exc).__name__, exc
+                )
+                results = []
+            found = arxiv_ids_from_urls(
+                [str(result.get("url") or "") for result in results]
+            )
+            if found:
+                break
+        logger.debug(
+            "DeepSeek search found %d candidate(s) for %r", len(found), title[:60]
+        )
+        return found[:10]
+
     def _ddgs_ids(self, title: str) -> list[str]:
-        """Blocking DDGS search — run in a thread. The rescue, not the default."""
+        """Blocking DDGS search — run in a thread. Opt-in, not the default.
+
+        Kept because on a network where its backends are not blocking us it is
+        a perfectly good rescuer; not the default because it was measured
+        refusing every request from this host (see `_search_sync`).
+        """
         try:
             from ddgs import DDGS
         except ImportError:
             logger.info("DDGS not installed — arXiv web-search fallback unavailable")
             return []
 
-        queries = [f'"{title[:200]}"']
+        queries = [f'"{_title_text(title)}"']
         words = title.split()
         if len(words) > 6:
-            queries.append(" ".join(words[:6]))
+            queries.append(_title_text(" ".join(words[:6])))
 
         found: list[str] = []
         for query in queries:
@@ -242,13 +346,13 @@ class ArxivTitleResolver:
                     proxy=settings.gfw_proxy or settings.download_proxy
                 ) as ddgs:
                     for hit in ddgs.text(
-                        f"site:arxiv.org {query.translate(_UNICODE_FIX)}",
+                        f"site:arxiv.org {query}",
                         max_results=50,
                         backend="duckduckgo,brave,google",
                     ):
-                        m = _ARXIV_ANY.search(hit.get("href", ""))
-                        if m and m.group(1) not in found:
-                            found.append(m.group(1))
+                        arxiv_id = arxiv_id_from_url(hit.get("href", ""))
+                        if arxiv_id and arxiv_id not in found:
+                            found.append(arxiv_id)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("DDGS query failed: %s", exc)
             if found:

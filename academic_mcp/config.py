@@ -217,13 +217,33 @@ class Settings:
         default_factory=lambda: env_float("ACADEMIC_CONVERT_BUDGET", 900.0)
     )
 
-    # ── arXiv title search (DDGS) ──────────────────────────────────────
+    # ── DeepSeek Search API (the arXiv title-search engine) ────────────
+    # Answering the web-search half of `arxiv-title-search`. Billed per
+    # successful request (5 CNY / 1000) rather than per result, limited to
+    # 5 QPS per account, and reached directly — it is the same host the
+    # DeepSeek model API uses, so the GFW proxy is neither needed nor wanted.
+    deepseek_api_key: str = field(default_factory=lambda: env("DEEPSEEK_API_KEY"))
+    deepseek_search_base: str = field(
+        default_factory=lambda: env("DEEPSEEK_SEARCH_BASE", "https://api.deepseek.com").rstrip("/")
+    )
+
+    # ── arXiv title search ─────────────────────────────────────────────
     arxiv_search_enabled: bool = field(default_factory=lambda: env_bool("ARXIV_SEARCH_ENABLED", True))
-    # Enforced with asyncio.wait_for around the blocking DDGS call. DDGS runs
-    # in a thread and can stall on the network; unwrapped, that would hold the
-    # caller's lock forever and stall every other fetch behind it.
+    # Enforced with asyncio.wait_for around the blocking discovery call. The
+    # search runs in a thread and can stall on the network; unwrapped, that
+    # would hold the caller's lock forever and stall every other fetch behind it.
     arxiv_search_timeout: float = field(
         default_factory=lambda: env_float("ARXIV_SEARCH_TIMEOUT", 35.0)
+    )
+    # Which web engine is consulted after the arXiv API comes back empty:
+    #   auto     — deepseek when DEEPSEEK_API_KEY is set, else ddgs (default)
+    #   deepseek — DeepSeek Search API
+    #   ddgs     — DuckDuckGo/Brave/Google fan-out (measured refusing us; opt-in)
+    #   none     — API only, never a search engine
+    # The arXiv API is always tried first: this selects the *rescue* engine,
+    # not the primary one (see resolver's `_search_sync`).
+    arxiv_search_engine: str = field(
+        default_factory=lambda: env("ARXIV_SEARCH_ENGINE", "auto").strip().lower()
     )
 
     # ── Session identity ───────────────────────────────────────────────
@@ -243,6 +263,19 @@ class Settings:
         # here, so every consumer sees the same policy.
         if self.download_proxy_mode not in ("primary", "fallback", "failover", "none"):
             self.download_proxy_mode = "fallback"
+
+    @property
+    def arxiv_web_engine(self) -> str | None:
+        """The web engine the arXiv title rescue consults, or None for neither.
+
+        ``auto`` resolves to DeepSeek when a key is configured and to DDGS
+        otherwise, so a deployment that has not added a key yet keeps its
+        previous behaviour instead of silently losing the rescue path.
+        """
+        engine = self.arxiv_search_engine
+        if engine == "auto":
+            engine = "deepseek" if self.deepseek_api_key else "ddgs"
+        return engine if engine in ("deepseek", "ddgs") else None
 
     @property
     def pdf_dir(self) -> Path:
@@ -348,6 +381,9 @@ class Settings:
             "camoufox_enabled": self.camoufox_enabled,
             "camoufox_timeout": self.camoufox_timeout,
             "arxiv_search_enabled": self.arxiv_search_enabled,
+            "arxiv_search_engine": self.arxiv_web_engine or "none",
+            "deepseek_configured": bool(self.deepseek_api_key),
+            "deepseek_search_base": self.deepseek_search_base,
         }
 
 
