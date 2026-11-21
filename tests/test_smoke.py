@@ -8,6 +8,7 @@ any of them fails here instead of in someone's literature review.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -1701,6 +1702,46 @@ def test_permits_doc_path_resolves_symlinks(tmp_path, monkeypatch):
 
     cfg = Settings(doc_roots_raw=str(root))
     assert cfg.permits_doc_path(link) is False
+
+
+def test_permits_doc_path_folds_case_on_wsl_drvfs():
+    """WSL's /mnt/<drive> mounts are case-insensitive, so the spelling must be too.
+
+    The regression: a root of ``/mnt/c/Users`` refused ``/mnt/c/users/...`` for
+    the same file, because the allow-list compared path strings exactly. That is
+    the one spelling a user is most likely to produce (a shell's tab completion
+    or a copied path), and it failed after the document had already been located.
+    """
+    from academic_mcp.config import Settings, _case_insensitive_mount
+
+    root = Path("/mnt/c/Users")
+    lowered = Path("/mnt/c/users")
+    if not root.is_dir() or not lowered.is_dir():
+        pytest.skip("WSL drvfs mount not available")
+    if not _case_insensitive_mount(root):
+        pytest.skip("this WSL build reports a case-sensitive /mnt mount")
+
+    # Pick an entry whose lowercase spelling stays lowercase after resolve().
+    # Junctions (e.g. "All Users" -> /mnt/c/ProgramData) resolve outside the
+    # root and are correctly refused; they would make this test lie.
+    requested = None
+    for sample in root.iterdir():
+        if sample.name.startswith("."):
+            continue
+        candidate = lowered / sample.name
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if str(resolved).startswith("/mnt/c/users/"):
+            requested = candidate
+            break
+    if requested is None:
+        pytest.skip("no non-junction entry under /mnt/c/Users")
+
+    cfg = Settings(doc_roots_raw=str(root))
+    assert cfg.permits_doc_path(requested) is True
+    assert cfg.permits_doc_path(Path("/mnt/c/Windows")) is False
 
 
 def _seed_cache(cache, doc, name: str, body: str) -> None:

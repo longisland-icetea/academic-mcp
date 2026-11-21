@@ -11,6 +11,7 @@ tiers, session DB, CORS, JWT, ...) which are deliberately not ported.
 from __future__ import annotations
 
 import os
+import platform
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,6 +107,37 @@ def _normalise_proxy(raw: str) -> str | None:
     if not raw or raw.lower() in ("none", "off", "false", "0"):
         return None
     return raw
+
+
+def _case_insensitive_mount(path: Path) -> bool:
+    """True for a path on a mount that folds case.
+
+    WSL exposes Windows drives under ``/mnt/<letter>``; those are drvfs mounts
+    where ``/mnt/c/users`` and ``/mnt/c/Users`` name the same directory. Linux
+    ext4 (``/home``, ``/tmp``) is case-sensitive, so folding is deliberately
+    limited to that shape rather than applied to every path.
+    """
+    if os.name == "nt":
+        return True
+    try:
+        if "microsoft" not in platform.release().lower():
+            return False
+    except OSError:  # pragma: no cover - platform.release is effectively total
+        return False
+    parts = path.parts
+    return len(parts) >= 3 and parts[1] == "mnt" and len(parts[2]) == 1 and parts[2].isalpha()
+
+
+def _relative_under(path: Path, root: Path, *, fold: bool) -> tuple[str, ...] | None:
+    """Path components below ``root``, or None when it is not underneath."""
+    path_parts = path.parts
+    root_parts = root.parts
+    if fold:
+        path_parts = tuple(part.casefold() for part in path_parts)
+        root_parts = tuple(part.casefold() for part in root_parts)
+    if len(path_parts) < len(root_parts) or path_parts[: len(root_parts)] != root_parts:
+        return None
+    return path_parts[len(root_parts) :]
 
 
 @dataclass
@@ -388,6 +420,12 @@ class Settings:
         component may be a dot-directory — a `.git`, `.ssh` or `.config` object
         is not what "convert my document" means.
 
+        The comparison is exact on case-sensitive Linux mounts. On WSL's
+        ``/mnt/<letter>`` drvfs mounts the filesystem itself folds case, so a
+        root of ``/mnt/c/Users`` must accept the ``/mnt/c/users/...`` spelling
+        the user actually typed; otherwise the same file is refused depending
+        on capitalisation.
+
         The one documented exception is DSH's own attachment store
         (`~/.dsh/attachments/…`), which is where a file the user dragged into the
         chat actually lives. Without it the dot-rule would refuse every uploaded
@@ -403,13 +441,19 @@ class Settings:
         if resolved.name.startswith("."):
             return False
         for root in self.doc_roots:
-            try:
-                relative = resolved.relative_to(root)
-            except ValueError:
+            relative = _relative_under(resolved, root, fold=False)
+            if relative is None and _case_insensitive_mount(resolved) and _case_insensitive_mount(root):
+                relative = _relative_under(resolved, root, fold=True)
+            if relative is None:
                 continue
-            if any(part.startswith(".") for part in relative.parts):
+            if any(part.startswith(".") for part in relative):
                 prefix = tuple(self.dsh_attachments.parts)
-                if tuple(resolved.parts[: len(prefix)]) != prefix:
+                same_prefix = tuple(resolved.parts[: len(prefix)]) == prefix
+                if not same_prefix and _case_insensitive_mount(resolved):
+                    same_prefix = tuple(part.casefold() for part in resolved.parts[: len(prefix)]) == tuple(
+                        part.casefold() for part in prefix
+                    )
+                if not same_prefix:
                     return False
             return True
         return False
