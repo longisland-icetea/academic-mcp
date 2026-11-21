@@ -38,6 +38,9 @@ async def search_papers(
     session_id: str = "",
     rerank: bool = True,
     save_cache: bool = True,
+    volume: str = "",
+    issue: str = "",
+    page: str = "",
 ) -> dict[str, Any]:
     """Scopus (primary) + OpenAlex, merged, deduplicated and hybrid-reranked.
 
@@ -75,10 +78,16 @@ async def search_papers(
         return {"ok": False, "error": "query, author or journal is required", "results": [], "count": 0}
 
     sources = {source} if source else {"scopus", "openalex"}
+    volume, issue, page = (volume or '').strip(), (issue or '').strip(), (page or '').strip()
+    # A bibliographic lookup (journal + volume/issue/page) has no free-text query
+    # to rerank against, and the exact match must not be reordered by a scorer.
+    if volume or issue or page:
+        rerank = False
     pool = min(limit * 2, 200) if rerank else limit
     results, engine_status = await search_mod.search_all(
         query, limit, year, sources,
         author=author or None, journal=journal or None, pool=pool,
+        volume=volume or None, issue=issue or None, page=page or None,
     )
     if rerank and query:
         results = search_mod._hybrid_rerank(results, query)[:limit]
@@ -520,6 +529,10 @@ def register(server: Any) -> None:
         description=(
             "Search the literature: Scopus (needs ELSEVIER_API_KEY) plus OpenAlex, "
             "merged and deduplicated. Pass `doi` for a direct metadata lookup. "
+            "Pass `journal` + `volume` (+ `issue` / `page`) to resolve a citation "
+            "bibliographically — 'Science 380, 1367 (2023)' → the exact paper and "
+            "its DOI, with no keyword guessing (volume+page routes to OpenAlex, the "
+            "only engine with biblio.* filters). "
             "Returns normalized paper objects (title, authors, year, doi, abstract, url)."
         ),
     )
@@ -534,10 +547,13 @@ def register(server: Any) -> None:
         session_id: str = "",
         rerank: bool = True,
         save_cache: bool = True,
+        volume: str = "",
+        issue: str = "",
+        page: str = "",
     ) -> str:
         result = await search_papers(
             query, doi, limit, year or None, source, author, journal,
-            session_id, rerank, save_cache,
+            session_id, rerank, save_cache, volume, issue, page,
         )
         return _payload(result)
 

@@ -557,7 +557,8 @@ def _scopus_transport_failed(exc: BaseException) -> None:
 
 
 async def search_scopus(query: str, limit: int = 20, year: str = None,
-                    author: str = None, journal: str = None) -> list:
+                    author: str = None, journal: str = None,
+                    volume: str = None, issue: str = None) -> list:
     if not ELSEVIER_API_KEY:
         return []
     if _scopus_cooling():
@@ -585,6 +586,11 @@ async def search_scopus(query: str, limit: int = 20, year: str = None,
     if journal:
         # Use Scopus field code SRCTITLE for journal/source title filtering
         parts.append(f"SRCTITLE({journal})")
+    if volume:
+        # Scopus field code VOLUME — pairs with SRCTITLE for a bibliographic hit.
+        parts.append(f"VOLUME({volume})")
+    if issue:
+        parts.append(f"ISSUE({issue})")
     scopus_query = " AND ".join(parts) if parts else normalize_query(query)
 
     params = {"query": scopus_query}
@@ -815,7 +821,9 @@ async def _resolve_openalex_source_id(journal_name: str, client: httpx.AsyncClie
 
 
 async def search_openalex(query: str, limit: int = 20, year: str | None = None,
-                         author: str | None = None, journal: str | None = None) -> list[dict[str, Any]]:
+                         author: str | None = None, journal: str | None = None,
+                         volume: str | None = None, issue: str | None = None,
+                         page: str | None = None) -> list[dict[str, Any]]:
     """Search OpenAlex. Journal filter uses two-step ID resolution via /sources.
 
     Note: when author filter is present, callers should skip OpenAlex entirely
@@ -826,6 +834,17 @@ async def search_openalex(query: str, limit: int = 20, year: str | None = None,
     filters = ["type:article|review"]
     if year:
         filters.append(f"publication_year:{year}")
+
+    # Bibliographic filters: journal + volume (+ issue / first page) pin one
+    # paper exactly. OpenAlex supports biblio.volume / biblio.issue /
+    # biblio.first_page; nothing else exposes a volume+page lookup, and the
+    # text-search path cannot answer "which paper is Nature 650, 580".
+    if volume:
+        filters.append(f"biblio.volume:{volume}")
+    if issue:
+        filters.append(f"biblio.issue:{issue}")
+    if page:
+        filters.append(f"biblio.first_page:{page}")
 
     # DOI lookup: use filter=doi:xxx, skip text search entirely
     if doi:
@@ -955,7 +974,9 @@ def _log(msg: str):
 async def search_all(query: str, limit: int = 20, year: str | None = None,
                      sources: set | None = None, progress_callback=None,
                      author: str | None = None, journal: str | None = None,
-                     pool: int | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                     pool: int | None = None, volume: str | None = None,
+                     issue: str | None = None,
+                     page: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Search across all enabled sources in parallel, merge and deduplicate.
 
     Args:
@@ -966,6 +987,13 @@ async def search_all(query: str, limit: int = 20, year: str | None = None,
     """
     if sources is None:
         sources = {"scopus", "openalex"}
+
+    # `page` is only filterable in OpenAlex (biblio.first_page). Scopus has no
+    # page field code, so letting it answer the same call would return papers
+    # that match journal+volume but not the page the caller named — precisely
+    # the wrong-paper risk a bibliographic lookup exists to remove.
+    if page and "openalex" in sources:
+        sources = {"openalex"}
 
     # With a larger pool, fetch that many per engine and merge to that size;
     # the caller truncates after reranking.
@@ -993,7 +1021,8 @@ async def search_all(query: str, limit: int = 20, year: str | None = None,
     tasks = {}
     if "scopus" in sources and ELSEVIER_API_KEY:
         tasks["scopus"] = _semaphore_wrap(
-            _get_sem(), lambda: search_scopus(query, eff_limit, year, author=author, journal=journal),
+            _get_sem(), lambda: search_scopus(query, eff_limit, year, author=author,
+                                              journal=journal, volume=volume, issue=issue),
         )
     else:
         tasks["scopus"] = asyncio.sleep(0, result=[])
@@ -1007,7 +1036,9 @@ async def search_all(query: str, limit: int = 20, year: str | None = None,
             tasks["openalex"] = asyncio.sleep(0, result=[])
         else:
             tasks["openalex"] = _semaphore_wrap(
-                _get_sem(), lambda: search_openalex(query, eff_limit, year, author=author, journal=journal),
+                _get_sem(), lambda: search_openalex(query, eff_limit, year, author=author,
+                                                    journal=journal, volume=volume,
+                                                    issue=issue, page=page),
             )
     else:
         tasks["openalex"] = asyncio.sleep(0, result=[])

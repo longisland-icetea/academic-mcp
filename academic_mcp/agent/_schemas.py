@@ -121,6 +121,12 @@ class SearchQuery(_StrictBase):
     year: str | None = None
     author: str | None = None
     journal: str | None = None
+    # Bibliographic lookup: journal + volume (+ issue / first page) identifies a
+    # paper exactly. Only OpenAlex can filter all three (biblio.* filters), so a
+    # query carrying `page` is routed to OpenAlex alone.
+    volume: str | None = None
+    issue: str | None = None
+    page: str | None = None
     search_goal: str | None = None
     source_engine: str = "all"  # all | scopus | openalex | semantic_scholar
 
